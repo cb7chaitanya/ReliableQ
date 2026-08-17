@@ -5,12 +5,26 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-107%20passing-brightgreen)](docs/failure-lab.md)
 
-A durable, database-backed background-job system in Rust. Clients
-submit jobs over HTTP; a bounded pool of worker processes claims and
-executes them asynchronously against a downstream (a bundled fake
-charge service), with **at-least-once execution** made safe through
-expiring token-fenced leases, a job-scoped idempotency key, and capped
-exponential backoff with full jitter.
+A durable, PostgreSQL-backed background-job system in Rust, built
+around one honest guarantee: **at-least-once execution, not
+exactly-once**. Clients `POST` a job over HTTP and it commits to
+Postgres before the API acknowledges it; a bounded pool of worker
+processes then claims and executes it — via expiring, token-fenced
+leases — against a downstream (a bundled fake charge service). A
+worker crash or lease expiry can make a job run twice, and this
+project doesn't hide that: the one bundled side effect is deduplicated
+by a deterministic, job-scoped idempotency key, so a job that runs
+twice still only charges once. Transient failures retry with capped,
+jittered backoff; permanent or budget-exhausted failures land in an
+inspectable, explicitly-replayable `DEAD` state instead of retrying
+forever or vanishing.
+
+Every one of those mechanisms was added to fix a *reproduced* failure,
+not a hypothetical one — `docs/failure-lab.md` walks through each
+invariant, the naive design that violated it, the concrete reproduction
+(a real crashed process, a real duplicate call), and the fix — and the
+same failure classes are re-verified continuously by a seeded,
+concurrent multi-worker chaos test suite.
 
 > Status: all 8 milestones complete (M0-M8). 107 tests passing, fmt
 > clean, clippy clean, seeded multi-worker chaos suite passing across
