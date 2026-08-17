@@ -445,3 +445,79 @@ single worker executes concurrently — a claimed batch of up to 10 jobs
 is currently processed one at a time only because the loop happens to
 be sequential, not because anything enforces a limit. A delayed
 downstream would let in-flight calls pile up unboundedly.
+
+## M6 — Bounded concurrency and graceful shutdown
+
+**Invariant.** SPEC.md sec. 14 invariant 9: "Local in-flight handler
+count never exceeds configured concurrency." Also sec. 9.5: no
+unbounded task queue, and shutdown must stop claiming, grant active
+work a grace period, and never mark abandoned work successful.
+
+**Naive design under test, demonstrated with a real measured
+downstream.** fake-charge grew a `DelayMs` chaos mode (persists until
+reset — every request sleeps N ms) and an in-flight peak counter, so
+"how many calls were actually concurrent" is measured, not inferred.
+Spawning all 20 claimed jobs immediately with no semaphore at all
+produced a measured peak of exactly 20 concurrent calls:
+
+```text
+test unbounded_spawning_lets_every_claimed_job_run_concurrently ... ok
+  (peak_inflight == JOB_COUNT == 20)
+```
+
+**The mechanism.** `spawn_bounded_batch` acquires one semaphore permit
+per job inside its own spawned task, and claiming itself is capped at
+`available_permits()` so unclaimed work never queues up behind a
+ticking lease waiting on a permit. Each in-flight job renews its own
+lease every `lease_duration / 3` via a background heartbeat, aborted
+once the charge call resolves — necessary now that jobs can genuinely
+run concurrently for a meaningful span. With `CONCURRENCY = 4` against
+the same 150ms-delayed downstream:
+
+```text
+test bounded_batch_never_exceeds_configured_concurrency ... ok
+  (peak_inflight <= 4, all 20 jobs still SUCCEEDED)
+```
+
+**A second, sharper failure found and fixed inside this milestone**
+(ADR 0006, worth its own entry): the first graceful-shutdown
+implementation inferred "no work in flight" from
+`semaphore.available_permits() == concurrency`. A test caught this as
+genuinely wrong, not flaky:
+
+```text
+test shutdown_waits_for_in_flight_work_within_grace_period ... FAILED
+  left: Running
+ right: Succeeded
+```
+
+Root cause: a freshly `tokio::spawn`ed task is not guaranteed to have
+been polled even once by the time the spawning code continues, so its
+permit hadn't been acquired yet — the drain loop read "all permits
+free" while a job sat claimed and abandoned. The fix: await the actual
+`JoinHandle` future the loop already had, with a timeout, instead of
+inferring anything from permit counts. Re-run clean, and stable across
+5 repeated runs (not a one-off pass):
+
+```text
+test shutdown_waits_for_in_flight_work_within_grace_period ... ok
+test shutdown_abandons_work_that_exceeds_the_grace_period ... ok
+test no_new_claims_after_shutdown_fires ... ok
+```
+
+**What this still cannot guarantee.** Concurrency is bounded *per
+worker process*, not fleet-wide — running N workers each configured
+for concurrency C can still produce up to N×C total in-flight calls
+against the downstream. That is a deliberate scope boundary (SPEC.md
+sec. 3: no multi-tenant fairness or cross-process coordination), not an
+oversight.
+
+**Evidence.** 5 new worker-level tests (2 concurrency, 3 shutdown) plus
+the `renew_lease` repository test. Full gate (`make gate`): fmt clean,
+clippy clean, **101 tests passing, 0 failed** (up from 95 at M5).
+
+**Residual risk carried into M7.** No metrics exist yet — the peak/
+in-flight/queue-depth numbers proven in this milestone's tests are only
+visible through test assertions, not through `/metrics` an operator
+could actually watch. Structured logs exist but aren't yet consistently
+enriched with `request_id` end-to-end.

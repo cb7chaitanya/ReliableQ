@@ -127,9 +127,107 @@ enough to burn through everyone's retry budget. Making that
 distinguishable in the data now means Part 5's dead-job tooling doesn't
 have to guess.
 
-## What's still missing
+## What's still missing after M4
 
 `Retry-After` on `429`/`503` isn't honored — those failures get the
 same computed backoff as any other transient one, not the server's
 suggested wait. That's a real gap, not an oversight I'm hiding; it's
 recorded plainly in ADR 0005 rather than left implicit.
+
+## Dead jobs are a state, not a second queue (M5)
+
+`DEAD` had been a real, guarded, terminal state since the very first
+milestone — the actual gap was purely operator-facing. There was no
+way to list dead jobs specifically and no way to replay one. The fix
+is almost embarrassingly small: `GET /v1/dead-jobs` is the same
+list/pagination code as `GET /v1/jobs` with the status fixed, and
+`POST /v1/jobs/{id}/retry` is one guarded SQL statement —
+`WHERE status = 'DEAD'` — that resets scheduling and clears the lease
+and error, but deliberately **keeps `attempts`** so the historical
+`job_attempts` audit trail survives and numbering continues instead of
+resetting to 1.
+
+The interesting part is what falls out for free. Retry reuses the same
+job ID. The charge idempotency key is `reliableq:charge:<job_id>` —
+job-scoped, from Part 3. So a job that already charged before dying for
+some unrelated reason will *replay*, not double-charge, on manual
+retry — with zero new idempotency code:
+
+```rust
+// same job ID, same idempotency key, second execute_charge call
+let outcome2 = execute_charge(&client, &charge_url, id, &payload).await;
+assert!(outcome2.is_ok(), "replay must still report success");
+
+let charge_count = /* query charges table */;
+assert_eq!(charge_count, 1, "retry of an already-charged dead job must not double-charge");
+```
+
+That test passing isn't luck — it's the direct, provable payoff of a
+design decision made two milestones earlier for an unrelated reason.
+
+## Bounded concurrency, and a bug the tests actually caught (M6)
+
+Every worker through M5 processed its claimed batch sequentially — one
+job at a time, `await`ed in a loop. Safe, but it left the
+`concurrency` config field sitting unused since M1. Making execution
+actually concurrent needed two things done together: a bound (so a
+delayed downstream can't have unlimited calls piled against it) and
+lease renewal (so a job whose real work outlives one lease period
+doesn't get its lease pulled out from under it mid-flight).
+
+Measuring the "before" honestly required a downstream that's
+*actually* slow for long enough to observe overlap — so fake-charge
+grew a delay-injection mode and an in-flight peak counter. Spawning 20
+claimed jobs with no bound at all produced a measured peak of exactly
+20 concurrent calls. Routing the same 20 jobs through
+`spawn_bounded_batch` with `concurrency = 4` produced a measured peak
+of ≤ 4, with all 20 still succeeding.
+
+That part went fine on the first try. What didn't was graceful
+shutdown — and this is worth walking through because the bug was real,
+not a flaky test:
+
+```text
+test shutdown_waits_for_in_flight_work_within_grace_period ... FAILED
+  left: Running
+ right: Succeeded
+```
+
+The shutdown drain logic polled `semaphore.available_permits() ==
+concurrency` to decide "is anything still in flight." That's wrong,
+and the failure proves it: `tokio::spawn` schedules a task, it doesn't
+guarantee that task has been polled even once by the time the spawning
+code moves on. A permit isn't decremented until the spawned task
+actually reaches its `acquire_owned().await` line. On this test's
+timing, shutdown fired before that first poll happened — the drain
+loop saw "4 of 4 permits free," concluded nothing was running, and
+returned immediately, abandoning a job that had been claimed but never
+even started.
+
+The fix removes the inference. Instead of asking whether the semaphore
+*looks* idle, shutdown reuses the exact same `JoinHandle` future the
+loop was already holding, and races *that* against the grace-period
+timeout:
+
+```rust
+match tokio::time::timeout(worker_config.shutdown_grace, &mut batch).await {
+    Ok(()) => tracing::info!("in-flight batch finished within the grace period"),
+    Err(_) => tracing::warn!("grace period elapsed; abandoning in-flight work"),
+}
+```
+
+A `JoinHandle` can't lie about whether its task has finished. A
+permit count can, for one specific window right after spawning, and
+that window is exactly where a real shutdown signal is likely to land.
+Re-run five times in a row to make sure it wasn't a coincidence: clean
+every time.
+
+## Where this leaves the project
+
+Bounded, retryable, idempotent, replayable, concurrency-safe — every
+guarantee in `DESIGN.md` now has a test that would fail if it stopped
+being true. What's left is making all of this *observable* from the
+outside without reading test output (metrics, structured logs with
+real correlation IDs — no dedicated post, see `docs/operations.md`),
+and a chaos suite that runs every one of these failure modes together,
+under seeded randomness, instead of one at a time. That's Part 5.
