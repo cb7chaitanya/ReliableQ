@@ -1,0 +1,69 @@
+# Full benchmark profile: published-result scale, matching the literal
+# defaults in the benchmarking task's own scenario definitions
+# (docs/benchmarking/design.md sec. 3-4). Long-running — expect this to
+# take a substantial fraction of an hour depending on the host. Has not
+# been executed end-to-end as part of producing the committed baseline
+# results (see docs/benchmarking/results.md "Limitations"); the quick
+# profile was.
+#
+# NOTE: `repeat` must stay above the first `[table]` header — see
+# quick.toml's comment for why.
+repeat = 3
+
+[environment]
+api_bind = "127.0.0.1:18080"
+worker_metrics_bind_base_port = 19100
+fake_charge_bind = "127.0.0.1:18081"
+database_url = "postgres://reliableq:reliableq@localhost:5432/reliableq"
+binary_dir = "target/release"
+
+[ingestion]
+enabled = true
+requests = 10000
+warmup_requests = 1000
+concurrencies = [1, 8, 32, 128]
+
+[execution]
+enabled = true
+job_count = 10000
+warmup_jobs = 1000
+concurrencies = [1, 2, 4, 8, 16, 32, 64]
+latencies_ms = [0, 100]
+
+[scaling]
+enabled = true
+job_count = 5000
+warmup_jobs = 500
+fixed_total = [[1, 16], [2, 8], [4, 4], [8, 2]]
+increasing = [[1, 8], [2, 8], [4, 8], [8, 8]]
+latency_ms = 20
+
+[claim_batch]
+enabled = true
+job_count = 5000
+batch_sizes = [1, 5, 10, 25, 50, 100]
+
+[downstream_latency]
+enabled = true
+job_count = 2000
+worker_concurrency = 16
+latencies_ms = [0, 5, 25, 100, 500, 1000]
+
+[retry_degradation]
+enabled = true
+job_count = 2000
+worker_concurrency = 16
+failure_rates = [0.0, 0.01, 0.05, 0.10, 0.25, 0.50]
+
+[backlog]
+enabled = true
+backlogs = [1000, 10000, 100000]
+worker_concurrency = 32
+
+[crash_recovery]
+enabled = true
+jobs_per_failpoint = 40
+
+[idempotency]
+enabled = true
+concurrency_levels = [1, 2, 8, 32, 64, 128]

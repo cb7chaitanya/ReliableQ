@@ -1,0 +1,72 @@
+# Quick benchmark profile: small job counts and few concurrency points,
+# meant to finish in minutes on a laptop. See docs/benchmarking/design.md.
+# The 100k-job point of scenario H (backlog) is intentionally absent here
+# (SPEC-BENCH sec. 4 H: "Allow the 100,000-job scenario to be excluded
+# from the quick profile") — see full.toml for it.
+#
+# NOTE: `repeat` must stay above the first `[table]` header — TOML
+# attaches trailing bare `key = value` lines to whichever table header
+# most recently opened, not to the document root, so placing it after
+# `[environment]` would silently make it `environment.repeat` (ignored
+# by BenchConfig, which then falls back to its own default of 3). Caught
+# by actually running the harness, not just writing it — see
+# docs/benchmarking/results.md "Limitations".
+repeat = 3
+
+[environment]
+api_bind = "127.0.0.1:18080"
+worker_metrics_bind_base_port = 19100
+fake_charge_bind = "127.0.0.1:18081"
+database_url = "postgres://reliableq:reliableq@localhost:5432/reliableq"
+binary_dir = "target/release"
+
+[ingestion]
+enabled = true
+requests = 600
+warmup_requests = 100
+concurrencies = [1, 8, 32]
+
+[execution]
+enabled = true
+job_count = 400
+warmup_jobs = 50
+concurrencies = [1, 2, 4, 8, 16]
+latencies_ms = [0, 100]
+
+[scaling]
+enabled = true
+job_count = 300
+warmup_jobs = 30
+fixed_total = [[1, 8], [2, 4], [4, 2]]
+increasing = [[1, 4], [2, 4], [4, 4]]
+latency_ms = 20
+
+[claim_batch]
+enabled = true
+job_count = 400
+batch_sizes = [1, 5, 10, 25, 50]
+
+[downstream_latency]
+enabled = true
+job_count = 200
+worker_concurrency = 8
+latencies_ms = [0, 25, 100, 500]
+
+[retry_degradation]
+enabled = true
+job_count = 200
+worker_concurrency = 8
+failure_rates = [0.0, 0.1, 0.25, 0.5]
+
+[backlog]
+enabled = true
+backlogs = [500, 2000]
+worker_concurrency = 16
+
+[crash_recovery]
+enabled = true
+jobs_per_failpoint = 8
+
+[idempotency]
+enabled = true
+concurrency_levels = [1, 4, 16, 64]

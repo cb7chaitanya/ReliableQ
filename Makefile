@@ -1,4 +1,4 @@
-.PHONY: up down migrate build fmt fmt-check lint test test-unit db-test gate run-api run-worker run-fake-charge
+.PHONY: up down migrate build fmt fmt-check lint test test-unit db-test gate run-api run-worker run-fake-charge bench-build bench-quick bench-full bench-report
 
 DATABASE_URL ?= postgres://reliableq:reliableq@localhost:5432/reliableq
 
@@ -44,3 +44,21 @@ run-worker:
 
 run-fake-charge:
 	DATABASE_URL=$(DATABASE_URL) cargo run -p fake-charge
+
+# Benchmark suite (docs/benchmarking/design.md). Deliberately not part of
+# `make gate` — these build release binaries and run for minutes
+# (bench-quick) to well over an hour (bench-full).
+bench-build:
+	cargo build --workspace --release
+
+bench-quick: bench-build
+	cargo run -p reliableq-bench --release -- run \
+		--config benchmarks/config/quick.toml --scenario all --out benchmarks/results
+
+bench-full: bench-build
+	cargo run -p reliableq-bench --release -- run \
+		--config benchmarks/config/full.toml --scenario all --out benchmarks/results
+
+bench-report:
+	cargo run -p reliableq-bench --release -- report \
+		--results benchmarks/results --out docs/benchmarking/results.md --charts benchmarks/reports

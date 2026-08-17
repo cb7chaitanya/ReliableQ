@@ -3,3 +3,9 @@
 .env
 *.pem
 .claude/
+
+# Raw per-run benchmark data (docs/benchmarking/design.md sec. 5) — large,
+# machine-specific, and regenerable; docs/benchmarking/results.md and
+# benchmarks/reports/*.svg (derived from it) are committed instead.
+/benchmarks/results/*
+!/benchmarks/results/.gitkeep
