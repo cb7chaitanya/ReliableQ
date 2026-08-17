@@ -3,5 +3,7 @@
 
 pub mod config;
 pub mod domain;
+pub mod failure;
 pub mod idempotency;
+pub mod retry;
 pub mod validation;
