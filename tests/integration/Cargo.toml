@@ -1,0 +1,25 @@
+[package]
+name = "reliableq-integration-tests"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+reliableq-core = { path = "../../crates/reliableq-core" }
+reliableq-db = { path = "../../crates/reliableq-db" }
+reliableq-api = { path = "../../crates/reliableq-api" }
+fake-charge = { path = "../../crates/fake-charge" }
+reliableq-worker = { path = "../../crates/reliableq-worker" }
+tokio.workspace = true
+axum.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+
+[[test]]
+name = "happy_path"
+path = "happy_path.rs"
