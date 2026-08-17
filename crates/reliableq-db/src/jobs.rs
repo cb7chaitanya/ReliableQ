@@ -5,9 +5,11 @@
 //! as `LEASE_LOST`, exhausted-budget expired leases move straight to
 //! `DEAD` instead of being stranded, and eligible rows are reclaimed
 //! with a fresh lease token, still under `FOR UPDATE SKIP LOCKED` so
-//! racing workers never double-claim. Retry scheduling (M4) and
-//! dead-job replay (M5) are not implemented yet — see
-//! `docs/failure-lab.md`.
+//! racing workers never double-claim. Retryable failures are scheduled
+//! back to `PENDING` with backoff (M4, `finalize_retry_scheduled`).
+//! `retry_dead_job` (M5) is the only path back from `DEAD`, reserved
+//! for explicit operator action — nothing here reclaims a `DEAD` job
+//! automatically. See `docs/failure-lab.md`.
 
 use std::time::Duration;
 
@@ -426,4 +428,40 @@ pub async fn finalize_dead(
 
     tx.commit().await?;
     Ok(true)
+}
+
+/// Explicit operator replay of a `DEAD` job (spec sec. 8.3): resets
+/// status/scheduling/lease/error/terminal-timestamp, but preserves
+/// `attempts` (and therefore the full historical `job_attempts` audit
+/// trail with monotonic numbering — the next claim continues counting
+/// from where it left off, not from zero) and reuses the same job ID
+/// (and therefore the same downstream idempotency key). Guarded by
+/// `WHERE status = 'DEAD'`; returns `None` if the job does not exist or
+/// is not currently `DEAD` (the caller distinguishes 404 vs 409).
+pub async fn retry_dead_job(
+    pool: &PgPool,
+    job_id: Uuid,
+    new_max_attempts: i32,
+) -> Result<Option<JobRow>, RepoError> {
+    let row = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE jobs
+        SET status = 'PENDING',
+            next_attempt_at = now(),
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            last_error_code = NULL,
+            last_error_message = NULL,
+            finished_at = NULL,
+            max_attempts = $2,
+            updated_at = now()
+        WHERE id = $1 AND status = 'DEAD'
+        RETURNING *
+        "#,
+    )
+    .bind(job_id)
+    .bind(new_max_attempts)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
