@@ -521,3 +521,94 @@ in-flight/queue-depth numbers proven in this milestone's tests are only
 visible through test assertions, not through `/metrics` an operator
 could actually watch. Structured logs exist but aren't yet consistently
 enriched with `request_id` end-to-end.
+
+## M7 — Observability and operational polish
+
+**Invariant/goal.** SPEC.md sec. 13: structured logs carry
+`request_id`, `job_id`, `attempt`, `worker_id`, `lease_token_hash`
+where applicable and never a raw lease token; the metric list in sec.
+13.2 exists and stays low-cardinality; a failure is traceable from
+submission through attempts to charge outcome using logs and
+inspection endpoints alone.
+
+**What was actually missing.** Every mechanism this project claims was
+already correct and tested by M6 — this milestone made the *evidence*
+visible outside the test suite: no `/metrics` anywhere, `worker_id`
+never appeared in a log line, lease tokens never appeared in logs at
+all (not because of active redaction — nothing had needed to log them),
+and every error response minted an unrelated fresh UUID as
+`request_id` instead of one traceable to an actual request.
+
+**The mechanism (ADR 0007).** Each process gets its own `/metrics`
+(the API's on `:8080`, the worker's own on `:9091`, since worker-only
+signals like `reliableq_inflight_jobs` and
+`reliableq_lease_renewals_total` have no way to reach the API process
+without adding a push pipeline this project deliberately doesn't have).
+`worker_id` is attached once via `#[tracing::instrument]` on the poll
+loop and propagated through `tokio::spawn` boundaries by explicitly
+capturing `tracing::Span::current()` and instrumenting each spawned
+task — spans do not cross that boundary automatically, which is easy
+to get wrong silently (no compiler error, just a missing field in
+logs). `request_id` uses `tokio::task_local!` so
+`ApiError::into_response` — which the `IntoResponse` trait gives no
+request access to — can still read the current request's correlation
+ID. `reliableq_core::redact::lease_token_hash` gives every lease-token
+log line a stable, non-reversible 12-character fingerprint.
+
+**Evidence, from actually running all three processes together**
+(not simulated):
+
+```text
+$ curl -s -X POST http://127.0.0.1:8080/v1/jobs -d '{...}'
+{"id":"fb4dc426-...","status":"PENDING",...}
+
+$ curl -s http://127.0.0.1:8080/v1/jobs/fb4dc426-... | jq .status
+"SUCCEEDED"
+
+$ curl -s http://127.0.0.1:8080/metrics | grep ^reliableq
+reliableq_jobs_submitted_total{kind="charge"} 1
+reliableq_job_queue_depth{status="SUCCEEDED"} 2
+reliableq_oldest_pending_age_seconds 0
+...
+
+$ curl -s http://127.0.0.1:9091/metrics | grep ^reliableq
+reliableq_downstream_requests_total{result="success"} 1
+reliableq_job_attempts_total{kind="charge",outcome="SUCCEEDED"} 1
+reliableq_inflight_jobs 0
+reliableq_job_duration_seconds{kind="charge",outcome="SUCCEEDED",...} ...
+
+$ curl -s -D - -o /dev/null http://127.0.0.1:8080/health/live | grep -i x-request-id
+x-request-id: 550f1375-e987-461d-be43-733999e02ea8
+
+# The worker's own log line for that job, unedited:
+run_worker_loop{worker_id=worker-199a0f3a-...}: reliableq_worker: job succeeded
+  job_id=fb4dc426-... attempt=1 lease_token_hash=ecb17df20b92
+
+# Chaos control confirmed inert by default:
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8081/v1/test/control -d '{"mode":"normal"}'
+404
+```
+
+The log line above is the concrete proof the span-propagation-across-
+`tokio::spawn` mechanism in ADR 0007 actually works: `worker_id` is
+present despite being attached three call-frames away, in a task
+spawned inside `spawn_bounded_batch`, not passed as a parameter
+anywhere in `execute_and_finalize`. `lease_token_hash` is present and
+is visibly not the raw UUID.
+
+**What this still cannot guarantee.** No distributed trace connects a
+job's API submission to its eventual worker execution — the
+`X-Request-Id` the worker sends to fake-charge is derived from the job
+ID at execution time, not carried from the original HTTP request that
+created the job. A real end-to-end trace would need a `request_id`
+column persisted on `jobs` at submission — a schema change this
+milestone did not need to make to satisfy the literal spec ask.
+
+**Evidence, full suite.** Full gate (`make gate`): fmt clean, clippy
+clean, **106 tests passing, 0 failed** (up from 101 at M6).
+
+**Residual risk carried into M8.** Every failure mode through M7 has
+been demonstrated *individually*. None has been run *together*, under
+seeded randomness, with multiple concurrent workers, across process
+crashes — the actual chaos suite the spec's test plan (sec. 17) calls
+for does not exist yet.
