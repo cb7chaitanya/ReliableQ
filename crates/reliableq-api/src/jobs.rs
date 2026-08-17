@@ -24,11 +24,16 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/jobs", post(submit_job).get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job))
+        .route("/v1/jobs/{id}/retry", post(retry_job))
+        .route("/v1/dead-jobs", get(list_dead_jobs))
 }
 
 const DEFAULT_MAX_ATTEMPTS: i32 = 5;
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 200;
+/// Additional attempts granted by a bare `POST /v1/jobs/{id}/retry`
+/// with no `max_attempts` override in the body.
+const DEFAULT_RETRY_BUDGET_INCREMENT: i32 = 5;
 
 fn default_max_attempts() -> i32 {
     DEFAULT_MAX_ATTEMPTS
@@ -195,7 +200,23 @@ async fn list_jobs(
         ),
         None => None,
     };
+    list_jobs_with_status(&state, status, &query).await
+}
 
+/// `GET /v1/dead-jobs` (spec sec. 8.2): "a convenience view equivalent
+/// to filtering DEAD." Same pagination as `GET /v1/jobs`, status fixed.
+async fn list_dead_jobs(
+    State(state): State<AppState>,
+    Query(query): Query<ListJobsQuery>,
+) -> Result<Json<ListJobsResponse>, ApiError> {
+    list_jobs_with_status(&state, Some(JobStatus::Dead), &query).await
+}
+
+async fn list_jobs_with_status(
+    state: &AppState,
+    status: Option<JobStatus>,
+    query: &ListJobsQuery,
+) -> Result<Json<ListJobsResponse>, ApiError> {
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     if !(1..=MAX_LIST_LIMIT).contains(&limit) {
         return Err(ApiError::invalid_argument(format!(
@@ -217,6 +238,51 @@ async fn list_jobs(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(ListJobsResponse { items, next_cursor }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RetryJobRequest {
+    pub max_attempts: Option<i32>,
+}
+
+async fn retry_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<RetryJobRequest>>,
+) -> Result<Json<JobSummary>, ApiError> {
+    let existing = jobs::get_job_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("job {id} not found")))?;
+    let existing_status = existing.status()?;
+    if existing_status != JobStatus::Dead {
+        return Err(ApiError::invalid_state(format!(
+            "job {id} is {existing_status}, not DEAD; only a DEAD job can be retried"
+        )));
+    }
+
+    let new_max_attempts = match body.and_then(|Json(b)| b.max_attempts) {
+        Some(requested) => {
+            validate_max_attempts(requested)?;
+            if requested <= existing.attempts {
+                return Err(ApiError::invalid_argument(format!(
+                    "max_attempts ({requested}) must be greater than the job's existing attempts ({})",
+                    existing.attempts
+                )));
+            }
+            requested
+        }
+        None => existing.attempts + DEFAULT_RETRY_BUDGET_INCREMENT,
+    };
+
+    let row = jobs::retry_dead_job(&state.db, id, new_max_attempts)
+        .await?
+        .ok_or_else(|| {
+            ApiError::invalid_state(format!(
+                "job {id} was no longer DEAD by the time the retry was applied"
+            ))
+        })?;
+
+    Ok(Json(JobSummary::try_from(row)?))
 }
 
 fn encode_cursor(created_at: DateTime<Utc>, id: Uuid) -> String {

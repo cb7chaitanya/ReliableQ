@@ -249,3 +249,169 @@ async fn list_rejects_limit_over_max() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+async fn make_dead_job(db: &TestDb, max_attempts: i32, attempts: i32) -> Uuid {
+    let id = Uuid::new_v4();
+    reliableq_db::jobs::insert_job(
+        &db.pool,
+        id,
+        "charge",
+        &valid_submission()["payload"],
+        max_attempts,
+    )
+    .await
+    .expect("insert");
+    sqlx::query(
+        "UPDATE jobs SET status = 'DEAD', attempts = $2, finished_at = now(), \
+         last_error_code = 'PERMANENT', last_error_message = 'rejected' WHERE id = $1",
+    )
+    .bind(id)
+    .bind(attempts)
+    .execute(&db.pool)
+    .await
+    .expect("force job dead");
+    id
+}
+
+#[tokio::test]
+async fn retry_resets_a_dead_job_to_pending() {
+    let db = TestDb::new().await;
+    let id = make_dead_job(&db, 5, 5).await;
+
+    let response = db
+        .app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/jobs/{id}/retry"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "PENDING");
+    assert_eq!(body["id"], id.to_string());
+    assert_eq!(
+        body["max_attempts"], 10,
+        "default retry budget increment is +5 over existing attempts"
+    );
+    assert!(body["last_error_code"].is_null());
+    assert!(body["finished_at"].is_null());
+}
+
+#[tokio::test]
+async fn retry_accepts_an_explicit_max_attempts_override() {
+    let db = TestDb::new().await;
+    let id = make_dead_job(&db, 3, 3).await;
+
+    let (status, body) = post_json(
+        db.app(),
+        &format!("/v1/jobs/{id}/retry"),
+        json!({ "max_attempts": 20 }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["max_attempts"], 20);
+}
+
+#[tokio::test]
+async fn retry_rejects_max_attempts_not_exceeding_existing_attempts() {
+    let db = TestDb::new().await;
+    let id = make_dead_job(&db, 5, 5).await;
+
+    let (status, body) = post_json(
+        db.app(),
+        &format!("/v1/jobs/{id}/retry"),
+        json!({ "max_attempts": 5 }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "INVALID_ARGUMENT");
+}
+
+#[tokio::test]
+async fn retry_on_non_dead_job_returns_409() {
+    let db = TestDb::new().await;
+    let (_, submitted) = post_json(db.app(), "/v1/jobs", valid_submission()).await;
+    let id = submitted["id"].as_str().unwrap();
+
+    let response = db
+        .app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/jobs/{id}/retry"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "INVALID_STATE");
+}
+
+#[tokio::test]
+async fn retry_on_missing_job_returns_404() {
+    let db = TestDb::new().await;
+    let response = db
+        .app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/jobs/{}/retry", Uuid::new_v4()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn retry_preserves_attempt_history() {
+    let db = TestDb::new().await;
+    let id = make_dead_job(&db, 1, 1).await;
+    sqlx::query(
+        "INSERT INTO job_attempts (job_id, attempt_number, worker_id, started_at, finished_at, outcome) \
+         VALUES ($1, 1, 'w1', now(), now(), 'DEAD')",
+    )
+    .bind(id)
+    .execute(&db.pool)
+    .await
+    .expect("seed attempt history");
+
+    post_json(db.app(), &format!("/v1/jobs/{id}/retry"), json!({})).await;
+
+    let attempt_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM job_attempts WHERE job_id = $1")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count attempts");
+    assert_eq!(attempt_count, 1, "retry must not delete attempt history");
+}
+
+#[tokio::test]
+async fn dead_jobs_endpoint_only_returns_dead_jobs() {
+    let db = TestDb::new().await;
+    let dead_id = make_dead_job(&db, 5, 5).await;
+    post_json(db.app(), "/v1/jobs", valid_submission()).await;
+
+    let (status, body) = get_json(db.app(), "/v1/dead-jobs").await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], dead_id.to_string());
+    assert_eq!(items[0]["status"], "DEAD");
+}
