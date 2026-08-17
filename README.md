@@ -6,8 +6,11 @@ machine, [`SPEC.md`](SPEC.md) for the full implementation brief, and
 [`docs/failure-lab.md`](docs/failure-lab.md) for the milestone-by-
 milestone reasoning trail.
 
-> Status: M0 (contract, skeleton, local environment) complete. See
-> `docs/failure-lab.md` for what is and is not proven so far.
+> Status: M1 (naive durable queue) complete — submit → claim → execute →
+> finalize works end to end for the happy path. Crash recovery, retries,
+> idempotency, dead jobs, and bounded concurrency are not implemented
+> yet by design; see `docs/failure-lab.md` for what's proven so far and
+> what each milestone still owes.
 
 ## Quick start
 
@@ -26,11 +29,21 @@ Run a binary individually:
 
 ```bash
 make run-api            # reliableq-api on :8080
-make run-worker         # placeholder until M1
-make run-fake-charge    # placeholder until M1
+make run-worker         # polls and executes charge jobs
+make run-fake-charge    # naive charge sink on :8081
 ```
 
 `make down` stops postgres. See `Makefile` for every target.
+
+With all three running, submit a job and watch it succeed:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/v1/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"charge","payload":{"customer_id":"c1","amount_cents":500,"currency":"INR"},"max_attempts":5}'
+
+curl -s http://127.0.0.1:8080/v1/jobs/<id-from-above>
+```
 
 ## Architecture
 
