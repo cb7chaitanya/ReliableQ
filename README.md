@@ -6,13 +6,14 @@ machine, [`SPEC.md`](SPEC.md) for the full implementation brief, and
 [`docs/failure-lab.md`](docs/failure-lab.md) for the milestone-by-
 milestone reasoning trail.
 
-> Status: M5 (dead jobs and operator replay) complete — `GET
-> /v1/dead-jobs` inspects terminal failures and `POST
-> /v1/jobs/{id}/retry` replays them without losing attempt history or
-> double-charging. Bounded concurrency, graceful shutdown, and full
-> observability are not implemented yet by design; see
-> `docs/failure-lab.md` for what's proven so far and what each
-> milestone still owes.
+> Status: M6 (bounded concurrency and graceful shutdown) complete — a
+> worker's in-flight downstream calls are capped by a semaphore with
+> measured evidence, long-running jobs renew their own lease, and
+> shutdown drains in-flight work within a grace period without ever
+> marking abandoned work successful. Full observability (metrics,
+> correlation IDs) and the seeded chaos suite are not implemented yet
+> by design; see `docs/failure-lab.md` for what's proven so far and
+> what each milestone still owes.
 
 ## Quick start
 
