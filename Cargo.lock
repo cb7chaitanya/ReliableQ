@@ -328,6 +328,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fake-charge"
+version = "0.1.0"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1160,6 +1164,10 @@ dependencies = [
  "tracing",
  "uuid",
 ]
+
+[[package]]
+name = "reliableq-worker"
+version = "0.1.0"
 
 [[package]]
 name = "ring"

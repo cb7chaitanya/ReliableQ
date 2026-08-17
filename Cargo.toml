@@ -4,6 +4,8 @@ members = [
     "crates/reliableq-core",
     "crates/reliableq-db",
     "crates/reliableq-api",
+    "crates/reliableq-worker",
+    "crates/fake-charge",
 ]
 
 [workspace.package]
