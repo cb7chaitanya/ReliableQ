@@ -1,7 +1,10 @@
-//! `POST /v1/charges` (spec sec. 8.5). M1 scope only: validates the
-//! request and the required `Idempotency-Key` header, then inserts.
-//! There is no pre-check/replay yet — see reliableq-db::charges and
-//! docs/failure-lab.md M3.
+//! `POST /v1/charges` (spec sec. 8.5). The first request for a given
+//! `Idempotency-Key` creates a charge (`201`); the same key with an
+//! identical payload replays the original charge (`200`,
+//! `replayed: true`); the same key with a different payload is a
+//! genuine conflict (`409 IDEMPOTENCY_CONFLICT`). See
+//! reliableq-db::charges::insert_or_get_charge for the atomic
+//! insert-or-discover this is built on.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -9,7 +12,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use reliableq_core::validation::parse_charge_payload;
-use reliableq_db::charges;
+use reliableq_db::charges::{self, ChargeRow, InsertChargeOutcome};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -29,6 +32,20 @@ pub struct ChargeResponse {
     pub currency: String,
     pub created_at: DateTime<Utc>,
     pub replayed: bool,
+}
+
+impl ChargeResponse {
+    fn from_row(row: ChargeRow, replayed: bool) -> Self {
+        Self {
+            id: row.id,
+            idempotency_key: row.idempotency_key,
+            customer_id: row.customer_id,
+            amount_cents: row.amount_cents,
+            currency: row.currency,
+            created_at: row.created_at,
+            replayed,
+        }
+    }
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
@@ -55,7 +72,7 @@ async fn create_charge(
     let payload = parse_charge_payload(&body)?;
 
     let id = Uuid::new_v4();
-    let row = charges::insert_charge(
+    let outcome = charges::insert_or_get_charge(
         &state.db,
         id,
         &key,
@@ -65,16 +82,16 @@ async fn create_charge(
     )
     .await?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(ChargeResponse {
-            id: row.id,
-            idempotency_key: row.idempotency_key,
-            customer_id: row.customer_id,
-            amount_cents: row.amount_cents,
-            currency: row.currency,
-            created_at: row.created_at,
-            replayed: false,
-        }),
-    ))
+    match outcome {
+        InsertChargeOutcome::Created(row) => Ok((
+            StatusCode::CREATED,
+            Json(ChargeResponse::from_row(row, false)),
+        )),
+        InsertChargeOutcome::Replayed(row) => {
+            Ok((StatusCode::OK, Json(ChargeResponse::from_row(row, true))))
+        }
+        InsertChargeOutcome::Conflict(_) => Err(ApiError::idempotency_conflict(format!(
+            "Idempotency-Key {key:?} was already used with a different request payload"
+        ))),
+    }
 }

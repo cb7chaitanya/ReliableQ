@@ -41,6 +41,10 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", message)
     }
 
+    pub fn idempotency_conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT", message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
     }

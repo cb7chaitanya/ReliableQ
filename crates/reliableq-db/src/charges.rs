@@ -1,9 +1,11 @@
-//! `charges` repository. M1 is intentionally naive: [`insert_charge`]
-//! does not check for an existing row before inserting. A genuine
-//! `idempotency_key` reuse hits the table's unique constraint and
-//! surfaces as [`RepoError::Database`] rather than a graceful replay —
-//! see `docs/failure-lab.md` M3, which replaces this with an atomic
-//! check-and-insert-or-replay plus payload-conflict detection.
+//! `charges` repository. [`insert_or_get_charge`] is the sole write
+//! path: an `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`
+//! atomically either creates the row or discovers it already exists,
+//! with no separate check-then-insert race window (spec sec. 8.5:
+//! "Concurrent duplicate requests must produce one charge row"). The
+//! table's unique constraint on `idempotency_key` remains the actual
+//! enforcement mechanism (spec sec. 7.4) — this function is just the
+//! graceful path on top of it.
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
@@ -21,18 +23,31 @@ pub struct ChargeRow {
     pub created_at: DateTime<Utc>,
 }
 
-pub async fn insert_charge(
+#[derive(Debug, Clone)]
+pub enum InsertChargeOutcome {
+    /// No prior charge existed for this key; this request created it.
+    Created(ChargeRow),
+    /// A charge already existed for this key with an identical
+    /// semantic payload — the existing row, safe to return as-is.
+    Replayed(ChargeRow),
+    /// A charge already existed for this key with a *different*
+    /// payload — a genuine idempotency-key collision, not a replay.
+    Conflict(ChargeRow),
+}
+
+pub async fn insert_or_get_charge(
     pool: &PgPool,
     id: Uuid,
     idempotency_key: &str,
     customer_id: &str,
     amount_cents: i64,
     currency: &str,
-) -> Result<ChargeRow, RepoError> {
-    let row = sqlx::query_as::<_, ChargeRow>(
+) -> Result<InsertChargeOutcome, RepoError> {
+    let inserted = sqlx::query_as::<_, ChargeRow>(
         r#"
         INSERT INTO charges (id, idempotency_key, customer_id, amount_cents, currency)
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING *
         "#,
     )
@@ -41,9 +56,33 @@ pub async fn insert_charge(
     .bind(customer_id)
     .bind(amount_cents)
     .bind(currency)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(row)
+
+    if let Some(row) = inserted {
+        return Ok(InsertChargeOutcome::Created(row));
+    }
+
+    // Someone won the race (possibly this exact caller, retrying).
+    // amount_cents/currency are never null in the schema, so an
+    // existing row is guaranteed to be found here.
+    let existing = find_by_idempotency_key(pool, idempotency_key)
+        .await?
+        .ok_or_else(|| {
+            RepoError::Inconsistent(format!(
+                "charge for idempotency_key {idempotency_key:?} disappeared immediately after an ON CONFLICT DO NOTHING"
+            ))
+        })?;
+
+    let is_same_semantic_request = existing.customer_id == customer_id
+        && existing.amount_cents == amount_cents
+        && existing.currency == currency;
+
+    if is_same_semantic_request {
+        Ok(InsertChargeOutcome::Replayed(existing))
+    } else {
+        Ok(InsertChargeOutcome::Conflict(existing))
+    }
 }
 
 pub async fn find_by_idempotency_key(

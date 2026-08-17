@@ -70,7 +70,7 @@ impl Drop for TestDb {
 async fn insert_and_find_round_trip() {
     let db = TestDb::new().await;
     let id = Uuid::new_v4();
-    charges::insert_charge(&db.pool, id, "key-1", "c1", 500, "INR")
+    charges::insert_or_get_charge(&db.pool, id, "key-1", "c1", 500, "INR")
         .await
         .expect("insert");
 
@@ -93,23 +93,42 @@ async fn find_missing_key_returns_none() {
     assert!(found.is_none());
 }
 
-/// M1's naive `insert_charge` has no dedup check: the database's unique
-/// constraint on `idempotency_key` is the only thing standing between a
-/// key reuse and a silent duplicate row, and it turns the reuse into an
-/// error rather than a graceful replay. This is the exact gap M3 closes
-/// (see docs/failure-lab.md).
 #[tokio::test]
-async fn reusing_an_idempotency_key_is_rejected_by_the_unique_constraint_not_replayed() {
+async fn first_insert_for_a_key_is_created() {
     let db = TestDb::new().await;
-    charges::insert_charge(&db.pool, Uuid::new_v4(), "dup-key", "c1", 500, "INR")
-        .await
-        .expect("first insert succeeds");
+    let outcome =
+        charges::insert_or_get_charge(&db.pool, Uuid::new_v4(), "key-a", "c1", 500, "INR")
+            .await
+            .expect("insert");
+    assert!(matches!(outcome, charges::InsertChargeOutcome::Created(_)));
+}
+
+/// The M3 fix: reusing an idempotency key with the identical semantic
+/// payload replays the original charge instead of erroring or
+/// duplicating (see docs/failure-lab.md M3).
+#[tokio::test]
+async fn reusing_a_key_with_the_same_payload_replays() {
+    let db = TestDb::new().await;
+    let first =
+        charges::insert_or_get_charge(&db.pool, Uuid::new_v4(), "dup-key", "c1", 500, "INR")
+            .await
+            .expect("first insert");
+    let first_row = match first {
+        charges::InsertChargeOutcome::Created(row) => row,
+        other => panic!("expected Created, got {other:?}"),
+    };
 
     let second =
-        charges::insert_charge(&db.pool, Uuid::new_v4(), "dup-key", "c1", 500, "INR").await;
-    assert!(
-        second.is_err(),
-        "naive insert must not silently succeed on a reused key"
+        charges::insert_or_get_charge(&db.pool, Uuid::new_v4(), "dup-key", "c1", 500, "INR")
+            .await
+            .expect("second insert");
+    let replayed_row = match second {
+        charges::InsertChargeOutcome::Replayed(row) => row,
+        other => panic!("expected Replayed, got {other:?}"),
+    };
+    assert_eq!(
+        replayed_row.id, first_row.id,
+        "a replay must return the original charge's id, not mint a new one"
     );
 
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM charges WHERE idempotency_key = $1")
@@ -119,6 +138,62 @@ async fn reusing_an_idempotency_key_is_rejected_by_the_unique_constraint_not_rep
         .expect("count");
     assert_eq!(
         count, 1,
-        "the unique constraint must still cap it at one row"
+        "exactly one charge row must exist per idempotency key"
     );
+}
+
+/// Reusing a key with a *different* payload is a genuine conflict, not
+/// a replay — silently returning the original charge would let a
+/// caller believe a different amount/customer was charged.
+#[tokio::test]
+async fn reusing_a_key_with_a_different_payload_is_a_conflict() {
+    let db = TestDb::new().await;
+    charges::insert_or_get_charge(&db.pool, Uuid::new_v4(), "conflict-key", "c1", 500, "INR")
+        .await
+        .expect("first insert");
+
+    let second =
+        charges::insert_or_get_charge(&db.pool, Uuid::new_v4(), "conflict-key", "c1", 999, "INR")
+            .await
+            .expect("second insert call");
+    assert!(matches!(second, charges::InsertChargeOutcome::Conflict(_)));
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM charges WHERE idempotency_key = $1")
+        .bind("conflict-key")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        count, 1,
+        "a conflicting request must not create a second row"
+    );
+}
+
+/// Concurrent duplicate requests must produce one charge row (spec sec.
+/// 8.5), not a race where both see "no existing row" and both insert.
+#[tokio::test]
+async fn concurrent_inserts_with_the_same_key_produce_one_row() {
+    let db = TestDb::new().await;
+    let (a, b) = tokio::join!(
+        charges::insert_or_get_charge(&db.pool, Uuid::new_v4(), "race-key", "c1", 500, "INR"),
+        charges::insert_or_get_charge(&db.pool, Uuid::new_v4(), "race-key", "c1", 500, "INR"),
+    );
+    let a = a.expect("insert a");
+    let b = b.expect("insert b");
+
+    let created_count = [&a, &b]
+        .iter()
+        .filter(|o| matches!(o, charges::InsertChargeOutcome::Created(_)))
+        .count();
+    assert_eq!(
+        created_count, 1,
+        "exactly one of the two racing requests should create the row"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM charges WHERE idempotency_key = $1")
+        .bind("race-key")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 1);
 }

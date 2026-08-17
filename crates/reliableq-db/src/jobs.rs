@@ -21,8 +21,8 @@ use uuid::Uuid;
 pub enum RepoError {
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("unexpected job status {0:?} found in database")]
-    UnexpectedStatus(String),
+    #[error("database state inconsistent with application invariants: {0}")]
+    Inconsistent(String),
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -53,8 +53,9 @@ impl JobRow {
     /// rather than a panic (SPEC.md sec. 19: no `unwrap`/`expect` in
     /// normal runtime paths).
     pub fn status(&self) -> Result<JobStatus, RepoError> {
-        JobStatus::parse_db_str(&self.status)
-            .ok_or_else(|| RepoError::UnexpectedStatus(self.status.clone()))
+        JobStatus::parse_db_str(&self.status).ok_or_else(|| {
+            RepoError::Inconsistent(format!("unexpected job status {:?}", self.status))
+        })
     }
 }
 

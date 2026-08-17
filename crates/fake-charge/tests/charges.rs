@@ -148,20 +148,21 @@ async fn invalid_payload_is_rejected() {
     assert_eq!(body["error"]["code"], "INVALID_ARGUMENT");
 }
 
-/// Documents the M1 gap this milestone is explicit about: reusing an
-/// idempotency key does not gracefully replay yet, it errors. M3 fixes
-/// this (see docs/failure-lab.md).
+/// M3 fix: reusing an idempotency key with the identical payload
+/// replays the original charge (see docs/failure-lab.md M3).
 #[tokio::test]
-async fn reused_idempotency_key_currently_errors_instead_of_replaying() {
+async fn reused_idempotency_key_with_same_payload_replays() {
     let db = TestDb::new().await;
-    let (first_status, _) = post_charge(db.app(), Some("dup"), valid_payload()).await;
+    let (first_status, first_body) = post_charge(db.app(), Some("dup"), valid_payload()).await;
     assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(first_body["replayed"], false);
 
-    let (second_status, _) = post_charge(db.app(), Some("dup"), valid_payload()).await;
+    let (second_status, second_body) = post_charge(db.app(), Some("dup"), valid_payload()).await;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_body["replayed"], true);
     assert_eq!(
-        second_status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "M1's naive service has no dedup check; this assertion documents the gap M3 closes"
+        second_body["id"], first_body["id"],
+        "a replay must return the original charge's id"
     );
 
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM charges WHERE idempotency_key = $1")
@@ -169,8 +170,54 @@ async fn reused_idempotency_key_currently_errors_instead_of_replaying() {
         .fetch_one(&db.pool)
         .await
         .expect("count");
+    assert_eq!(count, 1);
+}
+
+/// Reusing a key with a different payload must not silently succeed —
+/// it must surface as a distinguishable conflict.
+#[tokio::test]
+async fn reused_idempotency_key_with_different_payload_is_a_conflict() {
+    let db = TestDb::new().await;
+    let (first_status, _) = post_charge(db.app(), Some("conflict"), valid_payload()).await;
+    assert_eq!(first_status, StatusCode::CREATED);
+
+    let mut different = valid_payload();
+    different["amount_cents"] = json!(999);
+    let (second_status, second_body) = post_charge(db.app(), Some("conflict"), different).await;
+    assert_eq!(second_status, StatusCode::CONFLICT);
+    assert_eq!(second_body["error"]["code"], "IDEMPOTENCY_CONFLICT");
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM charges WHERE idempotency_key = $1")
+        .bind("conflict")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
     assert_eq!(
         count, 1,
-        "the database unique constraint still caps it at one row even though the request failed"
+        "a conflicting request must not create a second row"
     );
+}
+
+/// Concurrent duplicate HTTP requests must produce one charge row
+/// (spec sec. 8.5).
+#[tokio::test]
+async fn concurrent_duplicate_requests_produce_one_charge_row() {
+    let db = TestDb::new().await;
+    let app = db.app();
+    let (a, b) = tokio::join!(
+        post_charge(app.clone(), Some("race"), valid_payload()),
+        post_charge(app.clone(), Some("race"), valid_payload()),
+    );
+    let statuses = [a.0, b.0];
+    assert!(
+        statuses.contains(&StatusCode::CREATED) && statuses.contains(&StatusCode::OK),
+        "expected one 201 and one 200 (replay), got {statuses:?}"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM charges WHERE idempotency_key = $1")
+        .bind("race")
+        .fetch_one(&db.pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 1);
 }
