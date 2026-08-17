@@ -23,6 +23,7 @@ sqlx.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+rand.workspace = true
 tower = { version = "0.5", features = ["timeout", "util"] }
 
 [dev-dependencies]

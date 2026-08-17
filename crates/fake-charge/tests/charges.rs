@@ -223,3 +223,45 @@ async fn concurrent_duplicate_requests_produce_one_charge_row() {
         .expect("count");
     assert_eq!(count, 1);
 }
+
+/// Added for the benchmark suite's retry-degradation scenario (see
+/// docs/benchmarking/design.md sec. 4): a persistent, seeded failure
+/// *rate*, distinct from `fail_next`'s "fail exactly the next N calls."
+/// Statistical tolerance, not an exact count (same style as
+/// reliableq-core::retry's jitter-spread test) — this is chaos
+/// injection, not a claim about a specific RNG implementation.
+#[tokio::test]
+async fn fail_rate_mode_fails_approximately_the_configured_proportion() {
+    let db = TestDb::new().await;
+    let app = db.app();
+
+    let control = Request::builder()
+        .method("POST")
+        .uri("/v1/test/control")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"mode": "fail_rate", "rate": 0.3, "status": 503, "seed": 7}).to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(control).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut failures = 0;
+    for i in 0..300 {
+        let (status, _) =
+            post_charge(app.clone(), Some(&format!("rate-{i}")), valid_payload()).await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            failures += 1;
+        } else {
+            assert_eq!(status, StatusCode::CREATED);
+        }
+    }
+
+    // 300 trials at p=0.3: mean 90, stddev ~7.9. A generous +/-5 stddev
+    // band (55..125) keeps this from ever being flaky while still
+    // catching a badly wired rate (e.g. always-fail or never-fail).
+    assert!(
+        (55..=125).contains(&failures),
+        "expected roughly 30% of 300 requests to fail, got {failures}"
+    );
+}

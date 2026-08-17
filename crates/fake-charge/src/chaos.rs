@@ -15,16 +15,35 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::error::ApiError;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ChaosState {
     inner: Arc<Mutex<ChaosMode>>,
     inflight: Arc<AtomicUsize>,
     peak_inflight: Arc<AtomicUsize>,
+    /// Independent from `inner` so `ChaosMode` can keep deriving `Copy`.
+    /// Only consulted for `ChaosMode::FailRate`, added for the
+    /// benchmark suite's retry-degradation scenario (persistent
+    /// probabilistic failure, unlike `FailNext`'s "next N calls
+    /// exactly"). See docs/benchmarking/design.md sec. 4.
+    fail_rng: Arc<Mutex<StdRng>>,
+}
+
+impl Default for ChaosState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ChaosMode::default())),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            peak_inflight: Arc::new(AtomicUsize::new(0)),
+            fail_rng: Arc::new(Mutex::new(StdRng::from_entropy())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,6 +60,14 @@ enum ChaosMode {
     /// concurrent load is actually concurrent for long enough to
     /// measure (M6).
     DelayMs(u64),
+    /// Persists (not consumed) until reset: every request independently
+    /// fails with probability `rate`. Added for the benchmark suite's
+    /// retry-degradation scenario, which needs a fixed failure *rate*
+    /// rather than `FailNext`'s "fail exactly the next N calls."
+    FailRate {
+        rate: f64,
+        status: u16,
+    },
 }
 
 /// Outcome of consulting chaos state for one request: either let the
@@ -69,6 +96,19 @@ impl ChaosState {
         match *mode {
             ChaosMode::Normal | ChaosMode::DelayMs(_) => ChaosDecision::Proceed,
             ChaosMode::PermanentReject => ChaosDecision::Reject(StatusCode::UNPROCESSABLE_ENTITY),
+            ChaosMode::FailRate { rate, status } => {
+                let roll: f64 = {
+                    let mut rng = self.fail_rng.lock().unwrap_or_else(|e| e.into_inner());
+                    rng.r#gen()
+                };
+                if roll < rate {
+                    let status_code =
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                    ChaosDecision::Reject(status_code)
+                } else {
+                    ChaosDecision::Proceed
+                }
+            }
             ChaosMode::FailNext { remaining, status } => {
                 let next_remaining = remaining.saturating_sub(1);
                 *mode = if next_remaining == 0 {
@@ -124,9 +164,19 @@ impl Drop for InflightGuard {
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum ControlRequest {
     Normal,
-    FailNext { n: u32, status: u16 },
+    FailNext {
+        n: u32,
+        status: u16,
+    },
     PermanentReject,
-    DelayMs { ms: u64 },
+    DelayMs {
+        ms: u64,
+    },
+    FailRate {
+        rate: f64,
+        status: u16,
+        seed: Option<u64>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +201,22 @@ async fn set_control(
         }
         ControlRequest::PermanentReject => ChaosMode::PermanentReject,
         ControlRequest::DelayMs { ms } => ChaosMode::DelayMs(ms),
+        ControlRequest::FailRate { rate, status, seed } => {
+            if !(0.0..=1.0).contains(&rate) {
+                return Err(ApiError::invalid_argument(
+                    "rate must be between 0.0 and 1.0",
+                ));
+            }
+            if let Some(seed) = seed {
+                let mut rng = state
+                    .chaos
+                    .fail_rng
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *rng = StdRng::seed_from_u64(seed);
+            }
+            ChaosMode::FailRate { rate, status }
+        }
     };
     state.chaos.set(mode);
     Ok(Json(ControlResponse { ok: true }))
