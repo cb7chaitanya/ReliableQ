@@ -1,5 +1,10 @@
 # ReliableQ
 
+[![CI](https://github.com/cb7chaitanya/ReliableQ/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/cb7chaitanya/ReliableQ/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.94.0-orange?logo=rust)](rust-toolchain.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-107%20passing-brightgreen)](docs/failure-lab.md)
+
 A durable, database-backed background-job system in Rust. Clients
 submit jobs over HTTP; a bounded pool of worker processes claims and
 executes them asynchronously against a downstream (a bundled fake
@@ -181,3 +186,7 @@ list of what this project deliberately does not do, and
 - [`docs/operations.md`](docs/operations.md) — day-to-day procedures.
 - [`docs/interview-notes.md`](docs/interview-notes.md) — 60-second summary through honest production extensions.
 - [`SPEC.md`](SPEC.md) — the original implementation brief this project was built from.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
