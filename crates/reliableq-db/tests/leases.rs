@@ -291,3 +291,32 @@ async fn renew_lease_extends_expiry_and_is_fenced_by_token() {
         "a stale/wrong lease token must not be able to renew"
     );
 }
+
+#[tokio::test]
+async fn was_reclaimed_distinguishes_fresh_claims_from_reclaims() {
+    let db = TestDb::new().await;
+    let id = Uuid::new_v4();
+    jobs::insert_job(&db.pool, id, "charge", &charge_payload(), 5)
+        .await
+        .expect("insert");
+
+    let fresh = jobs::claim_pending_jobs(&db.pool, "worker-a", 10, Duration::from_millis(1))
+        .await
+        .expect("fresh claim");
+    assert_eq!(fresh.len(), 1);
+    assert!(
+        !fresh[0].was_reclaimed,
+        "a due PENDING job is not a reclaim"
+    );
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let reclaimed = jobs::claim_pending_jobs(&db.pool, "worker-b", 10, Duration::from_secs(30))
+        .await
+        .expect("reclaim");
+    assert_eq!(reclaimed.len(), 1);
+    assert!(
+        reclaimed[0].was_reclaimed,
+        "an expired RUNNING job reclaimed after lease expiry must be marked was_reclaimed"
+    );
+}

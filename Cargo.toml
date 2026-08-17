@@ -43,6 +43,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 rand = "0.8"
 anyhow = "1"
 base64 = "0.22"
+sha2 = "0.10"
 
 [profile.dev]
 debug = 1

@@ -67,6 +67,12 @@ impl JobRow {
 pub struct ClaimedJob {
     pub job: JobRow,
     pub attempt_number: i32,
+    /// `true` if this claim reclaimed an expired `RUNNING` lease (M2)
+    /// rather than claiming a due `PENDING` job — lets the caller
+    /// record `reliableq_lease_expirations_reclaimed_total` (spec sec.
+    /// 13.2) without the repository layer taking on metrics recording
+    /// itself.
+    pub was_reclaimed: bool,
 }
 
 pub async fn insert_job(
@@ -197,11 +203,14 @@ pub async fn claim_pending_jobs(
 
     // Step 3: claim due PENDING jobs and reclaim expired RUNNING jobs
     // that still have budget, in one guarded, row-locked statement so
-    // two workers racing on the same row never both win.
-    let claimed = sqlx::query_as::<_, JobRow>(
+    // two workers racing on the same row never both win. `was_reclaimed`
+    // records which branch a row came from, so the caller can count
+    // reliableq_lease_expirations_reclaimed_total (spec sec. 13.2)
+    // without the repository layer taking on metrics recording itself.
+    let claimed = sqlx::query_as::<_, ClaimRow>(
         r#"
         WITH due AS (
-            SELECT id FROM jobs
+            SELECT id, status FROM jobs
             WHERE (
                     (status = 'PENDING' AND next_attempt_at <= now())
                  OR (status = 'RUNNING' AND lease_expires_at <= now())
@@ -220,7 +229,7 @@ pub async fn claim_pending_jobs(
             updated_at = now()
         FROM due
         WHERE jobs.id = due.id
-        RETURNING jobs.*
+        RETURNING jobs.*, (due.status = 'RUNNING') AS was_reclaimed
         "#,
     )
     .bind(limit)
@@ -229,7 +238,8 @@ pub async fn claim_pending_jobs(
     .await?;
 
     let mut results = Vec::with_capacity(claimed.len());
-    for job in claimed {
+    for claimed_row in claimed {
+        let job = claimed_row.job;
         sqlx::query(
             r#"
             INSERT INTO job_attempts (job_id, attempt_number, worker_id, lease_token, started_at)
@@ -245,12 +255,20 @@ pub async fn claim_pending_jobs(
 
         results.push(ClaimedJob {
             attempt_number: job.attempts,
+            was_reclaimed: claimed_row.was_reclaimed,
             job,
         });
     }
 
     tx.commit().await?;
     Ok(results)
+}
+
+#[derive(Debug, FromRow)]
+struct ClaimRow {
+    #[sqlx(flatten)]
+    job: JobRow,
+    was_reclaimed: bool,
 }
 
 /// Finalizes a successful attempt. Returns `false` if the guarded
