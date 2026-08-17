@@ -176,6 +176,10 @@ pub struct WorkerConfig {
     /// abandoning it (spec sec. 9.5). Abandoned work is never marked
     /// successful; its lease simply expires and becomes reclaimable.
     pub shutdown_grace: Duration,
+    /// The worker is a separate process from the API, so it exposes its
+    /// own `/metrics` (spec sec. 13.2) for the metrics only it observes
+    /// (in-flight count, lease renewals, downstream call outcomes).
+    pub metrics_bind_addr: SocketAddr,
 }
 
 impl WorkerConfig {
@@ -187,6 +191,7 @@ impl WorkerConfig {
     pub const DEFAULT_RETRY_MULTIPLIER: u32 = 2;
     pub const DEFAULT_RETRY_MAX_DELAY_SECS: u64 = 60;
     pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
+    pub const DEFAULT_METRICS_BIND_ADDR: &'static str = "0.0.0.0:9091";
     const MAX_ALLOWED_CONCURRENCY: usize = 1000;
     const MAX_ALLOWED_POLL_INTERVAL_MS: u64 = 60_000;
     const MAX_ALLOWED_LEASE_DURATION_SECS: u64 = 3600;
@@ -222,6 +227,14 @@ impl WorkerConfig {
             "WORKER_SHUTDOWN_GRACE_SECS",
             Self::DEFAULT_SHUTDOWN_GRACE_SECS,
         )?;
+        let metrics_bind_addr_raw = env::var("WORKER_METRICS_BIND_ADDR")
+            .unwrap_or_else(|_| Self::DEFAULT_METRICS_BIND_ADDR.to_string());
+        let metrics_bind_addr = metrics_bind_addr_raw.parse::<SocketAddr>().map_err(|_| {
+            invalid(
+                "WORKER_METRICS_BIND_ADDR",
+                format!("{metrics_bind_addr_raw:?} is not host:port"),
+            )
+        })?;
 
         let config = Self {
             concurrency,
@@ -233,6 +246,7 @@ impl WorkerConfig {
             retry_multiplier,
             retry_max_delay: Duration::from_secs(retry_max_delay_secs),
             shutdown_grace: Duration::from_secs(shutdown_grace_secs),
+            metrics_bind_addr,
         };
         config.validate()?;
         Ok(config)
@@ -456,6 +470,7 @@ mod tests {
             "WORKER_LEASE_DURATION_SECS",
             "WORKER_CHARGE_SERVICE_URL",
             "WORKER_CHARGE_REQUEST_TIMEOUT_SECS",
+            "WORKER_METRICS_BIND_ADDR",
         ] {
             unsafe { env::remove_var(key) };
         }
@@ -504,6 +519,22 @@ mod tests {
         clear_worker_env();
         unsafe { env::set_var("WORKER_CHARGE_SERVICE_URL", "http://localhost:8081") };
         unsafe { env::set_var("WORKER_CONCURRENCY", "0") };
+        assert!(WorkerConfig::from_env().is_err());
+        clear_worker_env();
+    }
+
+    #[test]
+    #[serial]
+    fn worker_config_metrics_bind_addr_defaults_and_validates() {
+        clear_worker_env();
+        unsafe { env::set_var("WORKER_CHARGE_SERVICE_URL", "http://localhost:8081") };
+        let config = WorkerConfig::from_env().unwrap();
+        assert_eq!(
+            config.metrics_bind_addr,
+            WorkerConfig::DEFAULT_METRICS_BIND_ADDR.parse().unwrap()
+        );
+
+        unsafe { env::set_var("WORKER_METRICS_BIND_ADDR", "not-an-addr") };
         assert!(WorkerConfig::from_env().is_err());
         clear_worker_env();
     }
