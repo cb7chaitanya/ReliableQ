@@ -6,12 +6,11 @@ machine, [`SPEC.md`](SPEC.md) for the full implementation brief, and
 [`docs/failure-lab.md`](docs/failure-lab.md) for the milestone-by-
 milestone reasoning trail.
 
-> Status: M2 (expiring leases) complete — a worker crash no longer
-> strands work: an expired RUNNING lease is reclaimable, and stale
-> lease tokens are fenced out of finalization. Idempotency, retries,
-> dead jobs, and bounded concurrency are not implemented yet by design;
-> see `docs/failure-lab.md` for what's proven so far and what each
-> milestone still owes.
+> Status: M3 (idempotent charges) complete — re-executing the same job
+> after a crash now replays its charge instead of duplicating it.
+> Retries, dead jobs, and bounded concurrency are not implemented yet
+> by design; see `docs/failure-lab.md` for what's proven so far and
+> what each milestone still owes.
 
 ## Quick start
 
