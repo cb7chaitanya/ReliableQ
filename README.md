@@ -60,6 +60,15 @@ make run-fake-charge    # fake-charge     :8081
 
 ### Demo
 
+![Terminal recording of ReliableQ: a job submitted and executed successfully, a worker killed with kill -9 and its lease-expired job reclaimed by a second worker, a database check proving the twice-attempted job produced exactly one committed charge, a permanently-rejected job going DEAD, and an explicit operator retry succeeding.](docs/assets/reliableq-demo.gif)
+
+Recording generated with [VHS](https://github.com/charmbracelet/vhs) from
+[`scripts/reliableq-demo.tape`](scripts/reliableq-demo.tape) — a
+reproducible, checked-in definition, not a hand-edited video. Regenerate
+it with `vhs scripts/reliableq-demo.tape` after `make up`, `make
+migrate`, and building the three binaries. For the full guided version
+with explanatory step banners, run it yourself:
+
 ```bash
 scripts/demo.sh
 ```
