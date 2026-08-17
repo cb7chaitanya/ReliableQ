@@ -1,6 +1,7 @@
-//! Connection pool creation and migration runner shared by every binary
-//! that talks to PostgreSQL. Query repository functions land here in
-//! later milestones as the job/attempt/charge tables gain behavior.
+//! Connection pool creation, migration runner, and query repository
+//! functions shared by every binary that talks to PostgreSQL.
+
+pub mod jobs;
 
 use reliableq_core::config::DatabaseConfig;
 use sqlx::postgres::{PgPool, PgPoolOptions};
