@@ -465,3 +465,31 @@ pub async fn retry_dead_job(
     .await?;
     Ok(row)
 }
+
+/// Renews a lease mid-execution (spec sec. 9.3: "Heartbeat every
+/// one-third of the lease duration"), guarded by the same
+/// `status = 'RUNNING' AND lease_token = $2` fencing predicate as
+/// every other lease-touching statement. Returns `false` if the guard
+/// matched zero rows — the caller has already lost ownership (someone
+/// else reclaimed it after the lease expired) and must stop working.
+pub async fn renew_lease(
+    pool: &PgPool,
+    job_id: Uuid,
+    lease_token: Uuid,
+    lease_duration: Duration,
+) -> Result<bool, RepoError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE jobs
+        SET lease_expires_at = now() + make_interval(secs => $3),
+            updated_at = now()
+        WHERE id = $1 AND status = 'RUNNING' AND lease_token = $2
+        "#,
+    )
+    .bind(job_id)
+    .bind(lease_token)
+    .bind(lease_duration.as_secs_f64())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}

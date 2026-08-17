@@ -254,3 +254,40 @@ async fn expired_lease_with_exhausted_budget_becomes_dead_not_stranded() {
     assert!(job.lease_token.is_none());
     assert!(job.finished_at.is_some());
 }
+
+#[tokio::test]
+async fn renew_lease_extends_expiry_and_is_fenced_by_token() {
+    let db = TestDb::new().await;
+    let id = Uuid::new_v4();
+    jobs::insert_job(&db.pool, id, "charge", &charge_payload(), 5)
+        .await
+        .expect("insert");
+    let claimed = jobs::claim_pending_jobs(&db.pool, "worker-a", 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    let lease_token = claimed[0].job.lease_token.expect("lease token");
+    let original_expiry = claimed[0].job.lease_expires_at.expect("lease expiry");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let renewed = jobs::renew_lease(&db.pool, id, lease_token, Duration::from_secs(60))
+        .await
+        .expect("renew");
+    assert!(renewed);
+
+    let job = jobs::get_job_by_id(&db.pool, id)
+        .await
+        .expect("get")
+        .expect("job exists");
+    assert!(
+        job.lease_expires_at.unwrap() > original_expiry,
+        "renewal must push the expiry further into the future"
+    );
+
+    let stale_renew = jobs::renew_lease(&db.pool, id, Uuid::new_v4(), Duration::from_secs(60))
+        .await
+        .expect("renew call");
+    assert!(
+        !stale_renew,
+        "a stale/wrong lease token must not be able to renew"
+    );
+}
