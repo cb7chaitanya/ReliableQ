@@ -7,6 +7,7 @@ members = [
     "crates/reliableq-worker",
     "crates/fake-charge",
     "tests/integration",
+    "tests/chaos",
 ]
 
 [workspace.package]

@@ -1,0 +1,25 @@
+[package]
+name = "reliableq-chaos-tests"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+reliableq-core = { path = "../../crates/reliableq-core" }
+reliableq-db = { path = "../../crates/reliableq-db" }
+reliableq-worker = { path = "../../crates/reliableq-worker" }
+fake-charge = { path = "../../crates/fake-charge" }
+tokio.workspace = true
+axum.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+
+[[test]]
+name = "seeded_chaos"
+path = "seeded_chaos.rs"
