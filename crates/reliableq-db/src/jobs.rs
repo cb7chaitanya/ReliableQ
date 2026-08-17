@@ -1,9 +1,13 @@
 //! Job and job_attempts repository functions.
 //!
-//! M1 scope only: insert, read, list, naive claim of due `PENDING` jobs,
-//! and two terminal finalizations (`SUCCEEDED`, `DEAD`). There is
-//! intentionally no expired-lease reclaim (M2), retry scheduling (M4),
-//! or dead-job replay (M5) yet — see `docs/failure-lab.md`.
+//! Claiming (`claim_pending_jobs`) covers both due `PENDING` jobs and
+//! expired-lease `RUNNING` jobs (M2): abandoned attempts are closed out
+//! as `LEASE_LOST`, exhausted-budget expired leases move straight to
+//! `DEAD` instead of being stranded, and eligible rows are reclaimed
+//! with a fresh lease token, still under `FOR UPDATE SKIP LOCKED` so
+//! racing workers never double-claim. Retry scheduling (M4) and
+//! dead-job replay (M5) are not implemented yet — see
+//! `docs/failure-lab.md`.
 
 use std::time::Duration;
 
@@ -142,12 +146,63 @@ pub async fn claim_pending_jobs(
 ) -> Result<Vec<ClaimedJob>, RepoError> {
     let mut tx = pool.begin().await?;
 
+    // Step 1: close out any dangling attempt whose lease has expired
+    // without finalization. This runs whether the job below turns out
+    // to be reclaimable or exhausted, because from that attempt's own
+    // point of view its lease was simply lost either way.
+    sqlx::query(
+        r#"
+        UPDATE job_attempts
+        SET outcome = 'LEASE_LOST', finished_at = now()
+        WHERE outcome IS NULL
+          AND job_id IN (
+              SELECT id FROM jobs
+              WHERE status = 'RUNNING' AND lease_expires_at <= now()
+          )
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // Step 2: a job whose lease expired *and* has no attempts left can
+    // never be claimed again by step 3's guard below — without this it
+    // would stay RUNNING with an expired lease forever. Move it to DEAD
+    // now instead of leaving it stranded (spec sec. 9.1 point 2).
+    sqlx::query(
+        r#"
+        WITH exhausted AS (
+            SELECT id FROM jobs
+            WHERE status = 'RUNNING'
+              AND lease_expires_at <= now()
+              AND attempts >= max_attempts
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE jobs
+        SET status = 'DEAD',
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            last_error_code = 'LEASE_EXPIRED_BUDGET_EXHAUSTED',
+            last_error_message = 'lease expired after exhausting max_attempts with no successful finalize',
+            finished_at = now(),
+            updated_at = now()
+        FROM exhausted
+        WHERE jobs.id = exhausted.id
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // Step 3: claim due PENDING jobs and reclaim expired RUNNING jobs
+    // that still have budget, in one guarded, row-locked statement so
+    // two workers racing on the same row never both win.
     let claimed = sqlx::query_as::<_, JobRow>(
         r#"
         WITH due AS (
             SELECT id FROM jobs
-            WHERE status = 'PENDING'
-              AND next_attempt_at <= now()
+            WHERE (
+                    (status = 'PENDING' AND next_attempt_at <= now())
+                 OR (status = 'RUNNING' AND lease_expires_at <= now())
+                  )
               AND attempts < max_attempts
             ORDER BY next_attempt_at, created_at
             FOR UPDATE SKIP LOCKED
