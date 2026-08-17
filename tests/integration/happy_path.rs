@@ -62,9 +62,13 @@ impl Harness {
             .expect("migrations should apply cleanly");
 
         let charge_addr = spawn_app(fake_charge::build_app(
-            fake_charge::AppState { db: pool.clone() },
+            fake_charge::AppState {
+                db: pool.clone(),
+                chaos: fake_charge::chaos::ChaosState::default(),
+            },
             64 * 1024,
             Duration::from_secs(10),
+            false,
         ))
         .await;
 
@@ -121,9 +125,16 @@ impl Harness {
         .expect("claim");
         let count = claimed.len();
         let charge_url = format!("http://{}", self.charge_addr);
+        let retry_policy = reliableq_core::retry::RetryPolicy::DEFAULT;
         for job in claimed {
-            reliableq_worker::execute_and_finalize(&self.pool, &self.client, &charge_url, job)
-                .await;
+            reliableq_worker::execute_and_finalize(
+                &self.pool,
+                &self.client,
+                &charge_url,
+                &retry_policy,
+                job,
+            )
+            .await;
         }
         count
     }

@@ -302,10 +302,78 @@ pub async fn finalize_success(
     Ok(true)
 }
 
-/// Finalizes a job as permanently `DEAD`. M1 has no retry policy: every
-/// execution failure lands here directly (see `docs/failure-lab.md` M1
-/// entry). Returns `false` under the same fencing rule as
-/// [`finalize_success`].
+/// Schedules a retryable failure back onto the queue: `RUNNING ->
+/// PENDING` with `next_attempt_at` computed from **database** time plus
+/// `delay_seconds` (spec sec. 19: schedule against database time, not
+/// worker wall-clock, so clock skew between hosts cannot matter), lease
+/// cleared, sanitized error recorded. Returns `false` under the same
+/// fencing rule as [`finalize_success`].
+pub async fn finalize_retry_scheduled(
+    pool: &PgPool,
+    job_id: Uuid,
+    lease_token: Uuid,
+    delay_seconds: f64,
+    error_code: &str,
+    error_message: &str,
+    duration_ms: i64,
+) -> Result<bool, RepoError> {
+    let mut tx = pool.begin().await?;
+    let scheduled_delay_ms = (delay_seconds * 1000.0).round() as i64;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE jobs
+        SET status = 'PENDING',
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            next_attempt_at = now() + make_interval(secs => $3),
+            last_error_code = $4,
+            last_error_message = $5,
+            updated_at = now()
+        WHERE id = $1 AND status = 'RUNNING' AND lease_token = $2
+        "#,
+    )
+    .bind(job_id)
+    .bind(lease_token)
+    .bind(delay_seconds)
+    .bind(error_code)
+    .bind(error_message)
+    .execute(&mut *tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE job_attempts
+        SET outcome = 'RETRY_SCHEDULED',
+            finished_at = now(),
+            error_code = $3,
+            error_message = $4,
+            scheduled_delay_ms = $5,
+            duration_ms = $6
+        WHERE job_id = $1 AND lease_token = $2
+        "#,
+    )
+    .bind(job_id)
+    .bind(lease_token)
+    .bind(error_code)
+    .bind(error_message)
+    .bind(scheduled_delay_ms)
+    .bind(duration_ms)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Finalizes a job as permanently `DEAD`, whether from a permanent
+/// failure or an exhausted retry budget. Returns `false` under the same
+/// fencing rule as [`finalize_success`].
 pub async fn finalize_dead(
     pool: &PgPool,
     job_id: Uuid,

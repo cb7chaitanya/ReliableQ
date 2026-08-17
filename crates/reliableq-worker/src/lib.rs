@@ -4,18 +4,19 @@
 //! `LEASE_LOST`, and a stale worker's own finalize attempt is rejected
 //! by the token-fenced guard below — that is why the `Ok(false)`
 //! branches here only log, they do not need to write `LEASE_LOST`
-//! themselves. Re-execution is now safe against duplicate charges too
-//! (M3): the idempotency key is derived deterministically per job
-//! (`reliableq_core::idempotency::charge_idempotency_key`), and
-//! fake-charge replays rather than re-inserting on a repeat key.
-//! Remaining gaps, see `docs/failure-lab.md`:
+//! themselves. Re-execution is safe against duplicate charges (M3): the
+//! idempotency key is derived deterministically per job. Failures are
+//! now classified and, if retryable, scheduled with capped exponential
+//! backoff and full jitter (M4) instead of always going straight to
+//! `DEAD`. Remaining gap, see `docs/failure-lab.md`:
 //!
-//! - any execution failure goes straight to `DEAD`, no retry (M4)
 //! - jobs in a claimed batch are executed one at a time, unbounded
 //!   only in the sense that there is no semaphore yet (M6)
 
 use std::time::Instant;
 
+use reliableq_core::failure::{FailureClass, classify_http_status, classify_network_error};
+use reliableq_core::retry::RetryPolicy;
 use reliableq_core::validation::parse_charge_payload;
 use reliableq_db::jobs::{self, ClaimedJob};
 use reqwest::Client;
@@ -25,6 +26,7 @@ use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct ExecutionFailure {
+    pub class: FailureClass,
     pub code: &'static str,
     pub message: String,
 }
@@ -37,6 +39,7 @@ pub async fn execute_and_finalize(
     pool: &PgPool,
     client: &Client,
     charge_service_url: &str,
+    retry_policy: &RetryPolicy,
     claimed: ClaimedJob,
 ) {
     let job = claimed.job;
@@ -69,11 +72,16 @@ pub async fn execute_and_finalize(
                 tracing::error!(job_id = %job.id, error = %err, "failed to finalize success");
             }
         },
-        Err(failure) => {
-            match jobs::finalize_dead(
+        Err(failure) if failure.class.is_retryable() && attempt_number < job.max_attempts => {
+            let delay = retry_policy.delay(
+                u32::try_from(attempt_number).unwrap_or(u32::MAX),
+                &mut rand::thread_rng(),
+            );
+            match jobs::finalize_retry_scheduled(
                 pool,
                 job.id,
                 lease_token,
+                delay.as_secs_f64(),
                 failure.code,
                 &failure.message,
                 duration_ms,
@@ -85,7 +93,44 @@ pub async fn execute_and_finalize(
                         job_id = %job.id,
                         attempt = attempt_number,
                         code = failure.code,
-                        "job failed and moved to DEAD (M1 has no retry policy yet)"
+                        delay_ms = delay.as_millis() as u64,
+                        "job failed with a retryable error, rescheduled"
+                    );
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        attempt = attempt_number,
+                        "lease lost before retry could be scheduled"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(job_id = %job.id, error = %err, "failed to finalize retry");
+                }
+            }
+        }
+        Err(failure) => {
+            let reason = if failure.class.is_retryable() {
+                "RETRY_BUDGET_EXHAUSTED"
+            } else {
+                failure.code
+            };
+            match jobs::finalize_dead(
+                pool,
+                job.id,
+                lease_token,
+                reason,
+                &failure.message,
+                duration_ms,
+            )
+            .await
+            {
+                Ok(true) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        attempt = attempt_number,
+                        code = reason,
+                        "job failed permanently and moved to DEAD"
                     );
                 }
                 Ok(false) => {
@@ -115,6 +160,7 @@ pub async fn execute_charge(
     payload: &serde_json::Value,
 ) -> Result<(), ExecutionFailure> {
     let charge_payload = parse_charge_payload(payload).map_err(|err| ExecutionFailure {
+        class: FailureClass::Permanent,
         code: "INVALID_PAYLOAD",
         message: err.to_string(),
     })?;
@@ -135,6 +181,7 @@ pub async fn execute_charge(
         .send()
         .await
         .map_err(|err| ExecutionFailure {
+            class: classify_network_error(),
             code: "DOWNSTREAM_UNREACHABLE",
             message: err.to_string(),
         })?;
@@ -143,8 +190,10 @@ pub async fn execute_charge(
         Ok(())
     } else {
         let status = response.status();
+        let class = classify_http_status(status.as_u16());
         let body = response.text().await.unwrap_or_default();
         Err(ExecutionFailure {
+            class,
             code: "DOWNSTREAM_REJECTED",
             message: format!("charge service returned {status}: {body}"),
         })

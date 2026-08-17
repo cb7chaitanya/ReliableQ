@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let worker_id = format!("worker-{}", Uuid::new_v4());
+    let retry_policy = worker_config.retry_policy();
     tracing::info!(worker_id = %worker_id, "starting reliableq-worker");
 
     let mut shutdown = std::pin::pin!(shutdown_signal());
@@ -73,8 +74,14 @@ async fn main() -> anyhow::Result<()> {
         }
 
         for claimed_job in claimed {
-            execute_and_finalize(&db, &client, &worker_config.charge_service_url, claimed_job)
-                .await;
+            execute_and_finalize(
+                &db,
+                &client,
+                &worker_config.charge_service_url,
+                &retry_policy,
+                claimed_job,
+            )
+            .await;
         }
     }
 

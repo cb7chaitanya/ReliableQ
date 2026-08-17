@@ -23,10 +23,24 @@ async fn main() -> anyhow::Result<()> {
     let db = create_pool(&db_config).await?;
     run_migrations(&db).await?;
 
+    // Never true unless explicitly set (spec sec. 12: "safe from
+    // accidental production activation"). Deployments must not set
+    // this.
+    let enable_test_control = std::env::var("FAKE_CHARGE_ENABLE_TEST_CONTROL")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if enable_test_control {
+        tracing::warn!("FAKE_CHARGE_ENABLE_TEST_CONTROL is set: chaos control endpoint is live");
+    }
+
     let app = build_app(
-        AppState { db },
+        AppState {
+            db,
+            chaos: fake_charge::chaos::ChaosState::default(),
+        },
         http_config.max_body_bytes,
         http_config.request_timeout,
+        enable_test_control,
     );
 
     tracing::info!(addr = %http_config.bind_addr, "starting fake-charge");

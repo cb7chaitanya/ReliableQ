@@ -166,6 +166,12 @@ pub struct WorkerConfig {
     pub lease_duration: Duration,
     pub charge_service_url: String,
     pub charge_request_timeout: Duration,
+    /// Retry backoff configuration (spec sec. 10 defaults: 1s base,
+    /// 2x multiplier, 60s cap). Per-job `max_attempts` still comes from
+    /// the job row itself, not from here.
+    pub retry_base_delay: Duration,
+    pub retry_multiplier: u32,
+    pub retry_max_delay: Duration,
 }
 
 impl WorkerConfig {
@@ -173,10 +179,14 @@ impl WorkerConfig {
     pub const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
     pub const DEFAULT_LEASE_DURATION_SECS: u64 = 30;
     pub const DEFAULT_CHARGE_REQUEST_TIMEOUT_SECS: u64 = 10;
+    pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1_000;
+    pub const DEFAULT_RETRY_MULTIPLIER: u32 = 2;
+    pub const DEFAULT_RETRY_MAX_DELAY_SECS: u64 = 60;
     const MAX_ALLOWED_CONCURRENCY: usize = 1000;
     const MAX_ALLOWED_POLL_INTERVAL_MS: u64 = 60_000;
     const MAX_ALLOWED_LEASE_DURATION_SECS: u64 = 3600;
     const MAX_ALLOWED_CHARGE_REQUEST_TIMEOUT_SECS: u64 = 120;
+    const MAX_ALLOWED_RETRY_MAX_DELAY_SECS: u64 = 3600;
 
     pub fn from_env() -> Result<Self, ConfigError> {
         let concurrency = parse_env("WORKER_CONCURRENCY", Self::DEFAULT_CONCURRENCY)?;
@@ -192,6 +202,16 @@ impl WorkerConfig {
             "WORKER_CHARGE_REQUEST_TIMEOUT_SECS",
             Self::DEFAULT_CHARGE_REQUEST_TIMEOUT_SECS,
         )?;
+        let retry_base_delay_ms = parse_env(
+            "WORKER_RETRY_BASE_DELAY_MS",
+            Self::DEFAULT_RETRY_BASE_DELAY_MS,
+        )?;
+        let retry_multiplier =
+            parse_env("WORKER_RETRY_MULTIPLIER", Self::DEFAULT_RETRY_MULTIPLIER)?;
+        let retry_max_delay_secs = parse_env(
+            "WORKER_RETRY_MAX_DELAY_SECS",
+            Self::DEFAULT_RETRY_MAX_DELAY_SECS,
+        )?;
 
         let config = Self {
             concurrency,
@@ -199,9 +219,20 @@ impl WorkerConfig {
             lease_duration: Duration::from_secs(lease_duration_secs),
             charge_service_url,
             charge_request_timeout: Duration::from_secs(charge_request_timeout_secs),
+            retry_base_delay: Duration::from_millis(retry_base_delay_ms),
+            retry_multiplier,
+            retry_max_delay: Duration::from_secs(retry_max_delay_secs),
         };
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn retry_policy(&self) -> crate::retry::RetryPolicy {
+        crate::retry::RetryPolicy {
+            base_delay: self.retry_base_delay,
+            multiplier: self.retry_multiplier,
+            max_delay: self.retry_max_delay,
+        }
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -251,6 +282,32 @@ impl WorkerConfig {
                     "must be between 1 and {} seconds",
                     Self::MAX_ALLOWED_CHARGE_REQUEST_TIMEOUT_SECS
                 ),
+            ));
+        }
+        if self.retry_base_delay.is_zero() {
+            return Err(invalid(
+                "WORKER_RETRY_BASE_DELAY_MS",
+                "must be greater than 0",
+            ));
+        }
+        if self.retry_multiplier < 1 {
+            return Err(invalid("WORKER_RETRY_MULTIPLIER", "must be at least 1"));
+        }
+        if self.retry_max_delay.is_zero()
+            || self.retry_max_delay > Duration::from_secs(Self::MAX_ALLOWED_RETRY_MAX_DELAY_SECS)
+        {
+            return Err(invalid(
+                "WORKER_RETRY_MAX_DELAY_SECS",
+                format!(
+                    "must be between 1 and {} seconds",
+                    Self::MAX_ALLOWED_RETRY_MAX_DELAY_SECS
+                ),
+            ));
+        }
+        if self.retry_base_delay > self.retry_max_delay {
+            return Err(invalid(
+                "WORKER_RETRY_BASE_DELAY_MS",
+                "must not exceed WORKER_RETRY_MAX_DELAY_SECS",
             ));
         }
         Ok(())

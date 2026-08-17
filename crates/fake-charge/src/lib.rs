@@ -1,7 +1,10 @@
 //! fake-charge: a standalone service that records charges and
-//! deduplicates by idempotency key. M1 implements the charge endpoint
-//! without the dedup/replay behavior yet (see charges.rs doc comment).
+//! deduplicates by idempotency key (see charges.rs doc comment).
+//! Deterministic failure injection (spec sec. 12) is available via
+//! chaos.rs but its HTTP control route is only mounted when
+//! `enable_test_control` is explicitly passed — never in production.
 
+pub mod chaos;
 pub mod charges;
 pub mod error;
 
@@ -14,22 +17,33 @@ use sqlx::PgPool;
 use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
 
+use crate::chaos::ChaosState;
 use crate::error::ApiError;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
+    pub chaos: ChaosState,
 }
 
-pub fn build_app(state: AppState, max_body_bytes: usize, request_timeout: Duration) -> Router {
+pub fn build_app(
+    state: AppState,
+    max_body_bytes: usize,
+    request_timeout: Duration,
+    enable_test_control: bool,
+) -> Router {
     let timeout = ServiceBuilder::new()
         .layer(axum::error_handling::HandleErrorLayer::new(
             handle_timeout_error,
         ))
         .layer(TimeoutLayer::new(request_timeout));
 
-    Router::new()
-        .merge(charges::routes())
+    let mut router = Router::new().merge(charges::routes());
+    if enable_test_control {
+        router = router.merge(chaos::routes());
+    }
+
+    router
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(timeout)
         .with_state(state)

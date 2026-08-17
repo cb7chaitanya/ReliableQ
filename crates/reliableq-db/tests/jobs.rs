@@ -372,3 +372,88 @@ fn assert_repo_error_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<RepoError>();
 }
+
+#[tokio::test]
+async fn finalize_retry_scheduled_reschedules_and_clears_lease() {
+    let db = TestDb::new().await;
+    let id = Uuid::new_v4();
+    jobs::insert_job(&db.pool, id, "charge", &charge_payload(), 5)
+        .await
+        .expect("insert");
+    let claimed = jobs::claim_pending_jobs(&db.pool, "worker-1", 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    let lease_token = claimed[0].job.lease_token.expect("lease token");
+
+    let ok = jobs::finalize_retry_scheduled(
+        &db.pool,
+        id,
+        lease_token,
+        30.0,
+        "TRANSIENT",
+        "simulated 503",
+        5,
+    )
+    .await
+    .expect("finalize retry");
+    assert!(ok);
+
+    let job = jobs::get_job_by_id(&db.pool, id)
+        .await
+        .expect("get")
+        .expect("job exists");
+    assert_eq!(job.status().unwrap(), JobStatus::Pending);
+    assert!(job.lease_token.is_none());
+    assert_eq!(job.last_error_code.as_deref(), Some("TRANSIENT"));
+    assert!(
+        job.next_attempt_at > job.created_at,
+        "next_attempt_at must be pushed into the future by the scheduled delay"
+    );
+
+    let (outcome, scheduled_delay_ms): (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT outcome, scheduled_delay_ms FROM job_attempts WHERE job_id = $1 AND attempt_number = 1",
+    )
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("fetch attempt");
+    assert_eq!(outcome.as_deref(), Some("RETRY_SCHEDULED"));
+    assert_eq!(scheduled_delay_ms, Some(30_000));
+}
+
+/// Demonstrates the exact danger a "tight" (zero-delay) retry policy
+/// creates: nothing in the repository layer stops a delay of zero from
+/// making a job immediately due again. This is real behavior of a real
+/// primitive, not a hypothetical — it's why reliableq-worker's actual
+/// policy (reliableq_core::retry::RetryPolicy::DEFAULT) always has a
+/// non-zero base_delay, and why full jitter's *cap* per attempt, not
+/// the delay floor, is what bounds retry load. See docs/failure-lab.md
+/// M4.
+#[tokio::test]
+async fn zero_delay_retry_scheduling_makes_a_job_immediately_reclaimable() {
+    let db = TestDb::new().await;
+    let id = Uuid::new_v4();
+    jobs::insert_job(&db.pool, id, "charge", &charge_payload(), 5)
+        .await
+        .expect("insert");
+    let claimed = jobs::claim_pending_jobs(&db.pool, "worker-a", 10, Duration::from_secs(30))
+        .await
+        .expect("claim");
+    let lease_token = claimed[0].job.lease_token.expect("lease token");
+
+    jobs::finalize_retry_scheduled(&db.pool, id, lease_token, 0.0, "TRANSIENT", "simulated", 1)
+        .await
+        .expect("finalize retry with zero delay");
+
+    // No sleep at all: if a zero-delay retry is claimable immediately,
+    // that is exactly the thundering-herd risk a real backoff policy
+    // must prevent by never producing a zero (or near-zero) delay.
+    let reclaimed = jobs::claim_pending_jobs(&db.pool, "worker-b", 10, Duration::from_secs(30))
+        .await
+        .expect("claim immediately after a zero-delay retry");
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "a zero-delay retry is due again with no backoff at all"
+    );
+}

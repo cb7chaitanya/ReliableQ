@@ -71,6 +71,14 @@ async fn create_charge(
     let key = idempotency_key(&headers)?;
     let payload = parse_charge_payload(&body)?;
 
+    if let crate::chaos::ChaosDecision::Reject(status) = state.chaos.decide() {
+        return Err(ApiError::new(
+            status,
+            "INJECTED_FAILURE",
+            format!("chaos injection: simulated {status} response"),
+        ));
+    }
+
     let id = Uuid::new_v4();
     let outcome = charges::insert_or_get_charge(
         &state.db,

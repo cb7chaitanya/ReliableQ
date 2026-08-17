@@ -61,9 +61,13 @@ impl Harness {
             .expect("migrations should apply cleanly");
 
         let charge_addr = spawn_app(fake_charge::build_app(
-            fake_charge::AppState { db: pool.clone() },
+            fake_charge::AppState {
+                db: pool.clone(),
+                chaos: fake_charge::chaos::ChaosState::default(),
+            },
             64 * 1024,
             Duration::from_secs(10),
+            false,
         ))
         .await;
 

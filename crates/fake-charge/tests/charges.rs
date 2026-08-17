@@ -65,9 +65,11 @@ impl TestDb {
         build_app(
             AppState {
                 db: self.pool.clone(),
+                chaos: fake_charge::chaos::ChaosState::default(),
             },
             64 * 1024,
             Duration::from_secs(10),
+            true,
         )
     }
 }
