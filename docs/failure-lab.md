@@ -394,3 +394,54 @@ Full gate (`make gate`): fmt clean, clippy clean, **87 tests passing,
 **Residual risk carried into M5.** Dead jobs (from either exhaustion or
 a permanent failure) have no inspection endpoint and no replay path —
 `GET /v1/dead-jobs` and `POST /v1/jobs/{id}/retry` do not exist yet.
+
+## M5 — Dead jobs and operator replay
+
+**Invariant.** SPEC.md sec. 11: "Dead jobs are never claimed
+automatically. Operators can inspect and explicitly retry them." Also:
+retry "must reuse the same job ID and therefore the same downstream
+idempotency key" (sec. 8.3) — a direct load-bearing consequence of ADR
+0004's job-scoped key.
+
+**What M1-M4 already provide.** `DEAD` has been a real, guarded,
+terminal state since M1; `dead_jobs_are_not_claimable` has been tested
+since M1 and `expired_lease_with_exhausted_budget_becomes_dead_not_stranded`
+since M2. What was actually missing was purely the *operator-facing*
+surface: no way to list dead jobs specifically, no way to replay one.
+
+**The mechanism.** `reliableq_db::jobs::retry_dead_job` is a single
+guarded statement — `WHERE status = 'DEAD'` — that resets
+status/scheduling/lease/error/`finished_at` but **preserves
+`attempts`**, so the historical `job_attempts` rows stay intact and the
+next attempt continues numbering monotonically rather than restarting
+at 1. `POST /v1/jobs/{id}/retry` computes a new `max_attempts` (client
+override, validated `> attempts`, or a default `+5` over the existing
+count), returns `200` with the reset job, `404` if the job doesn't
+exist, `409 INVALID_STATE` if it isn't currently `DEAD`. `GET
+/v1/dead-jobs` reuses the same list/pagination logic as `GET /v1/jobs`
+with status fixed to `DEAD`.
+
+**The idempotency consequence, proven not just asserted.** Since retry
+reuses the job ID, and the charge idempotency key is
+`reliableq:charge:<job_id>` (ADR 0004), a dead job that already charged
+before dying must replay — not double-charge — on manual retry, with
+zero new idempotency logic required:
+
+```text
+crates/reliableq-worker/tests/dead_job_retry.rs
+  test retrying_a_dead_job_that_already_charged_replays_not_duplicates ... ok
+```
+
+**Evidence.** 8 new API tests (retry happy path, explicit
+`max_attempts` override, rejected same-or-lower override, 409 on
+non-dead, 404 on missing, attempt-history preservation, dead-jobs
+listing) plus the worker-level replay-on-retry test above.
+
+Full gate (`make gate`): fmt clean, clippy clean, **95 tests passing,
+0 failed** (up from 87 at M4).
+
+**Residual risk carried into M6.** Nothing bounds how many jobs a
+single worker executes concurrently — a claimed batch of up to 10 jobs
+is currently processed one at a time only because the loop happens to
+be sequential, not because anything enforces a limit. A delayed
+downstream would let in-flight calls pile up unboundedly.
