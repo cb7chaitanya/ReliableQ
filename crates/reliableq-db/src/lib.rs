@@ -1,6 +1,7 @@
 //! Connection pool creation, migration runner, and query repository
 //! functions shared by every binary that talks to PostgreSQL.
 
+pub mod attempts;
 pub mod jobs;
 
 use reliableq_core::config::DatabaseConfig;

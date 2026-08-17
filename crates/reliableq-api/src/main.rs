@@ -23,7 +23,11 @@ async fn main() -> anyhow::Result<()> {
     let db = create_pool(&db_config).await?;
     run_migrations(&db).await?;
 
-    let app = build_app(AppState { db });
+    let app = build_app(
+        AppState { db },
+        http_config.max_body_bytes,
+        http_config.request_timeout,
+    );
 
     tracing::info!(addr = %http_config.bind_addr, "starting reliableq-api");
     let listener = tokio::net::TcpListener::bind(http_config.bind_addr).await?;
