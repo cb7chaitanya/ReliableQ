@@ -156,6 +156,107 @@ impl HttpConfig {
     }
 }
 
+/// Worker polling, claiming, leasing, and downstream-call configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerConfig {
+    /// Bounds in-flight handlers (enforced starting M6; stored and
+    /// validated from M1 so the config surface does not change later).
+    pub concurrency: usize,
+    pub poll_interval: Duration,
+    pub lease_duration: Duration,
+    pub charge_service_url: String,
+    pub charge_request_timeout: Duration,
+}
+
+impl WorkerConfig {
+    pub const DEFAULT_CONCURRENCY: usize = 10;
+    pub const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
+    pub const DEFAULT_LEASE_DURATION_SECS: u64 = 30;
+    pub const DEFAULT_CHARGE_REQUEST_TIMEOUT_SECS: u64 = 10;
+    const MAX_ALLOWED_CONCURRENCY: usize = 1000;
+    const MAX_ALLOWED_POLL_INTERVAL_MS: u64 = 60_000;
+    const MAX_ALLOWED_LEASE_DURATION_SECS: u64 = 3600;
+    const MAX_ALLOWED_CHARGE_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let concurrency = parse_env("WORKER_CONCURRENCY", Self::DEFAULT_CONCURRENCY)?;
+        let poll_interval_ms =
+            parse_env("WORKER_POLL_INTERVAL_MS", Self::DEFAULT_POLL_INTERVAL_MS)?;
+        let lease_duration_secs = parse_env(
+            "WORKER_LEASE_DURATION_SECS",
+            Self::DEFAULT_LEASE_DURATION_SECS,
+        )?;
+        let charge_service_url = env::var("WORKER_CHARGE_SERVICE_URL")
+            .map_err(|_| ConfigError::Missing("WORKER_CHARGE_SERVICE_URL"))?;
+        let charge_request_timeout_secs = parse_env(
+            "WORKER_CHARGE_REQUEST_TIMEOUT_SECS",
+            Self::DEFAULT_CHARGE_REQUEST_TIMEOUT_SECS,
+        )?;
+
+        let config = Self {
+            concurrency,
+            poll_interval: Duration::from_millis(poll_interval_ms),
+            lease_duration: Duration::from_secs(lease_duration_secs),
+            charge_service_url,
+            charge_request_timeout: Duration::from_secs(charge_request_timeout_secs),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.concurrency == 0 || self.concurrency > Self::MAX_ALLOWED_CONCURRENCY {
+            return Err(invalid(
+                "WORKER_CONCURRENCY",
+                format!("must be between 1 and {}", Self::MAX_ALLOWED_CONCURRENCY),
+            ));
+        }
+        if self.poll_interval.is_zero()
+            || self.poll_interval > Duration::from_millis(Self::MAX_ALLOWED_POLL_INTERVAL_MS)
+        {
+            return Err(invalid(
+                "WORKER_POLL_INTERVAL_MS",
+                format!(
+                    "must be between 1 and {} ms",
+                    Self::MAX_ALLOWED_POLL_INTERVAL_MS
+                ),
+            ));
+        }
+        if self.lease_duration.is_zero()
+            || self.lease_duration > Duration::from_secs(Self::MAX_ALLOWED_LEASE_DURATION_SECS)
+        {
+            return Err(invalid(
+                "WORKER_LEASE_DURATION_SECS",
+                format!(
+                    "must be between 1 and {} seconds",
+                    Self::MAX_ALLOWED_LEASE_DURATION_SECS
+                ),
+            ));
+        }
+        if !(self.charge_service_url.starts_with("http://")
+            || self.charge_service_url.starts_with("https://"))
+        {
+            return Err(invalid(
+                "WORKER_CHARGE_SERVICE_URL",
+                "must be an http:// or https:// URL",
+            ));
+        }
+        if self.charge_request_timeout.is_zero()
+            || self.charge_request_timeout
+                > Duration::from_secs(Self::MAX_ALLOWED_CHARGE_REQUEST_TIMEOUT_SECS)
+        {
+            return Err(invalid(
+                "WORKER_CHARGE_REQUEST_TIMEOUT_SECS",
+                format!(
+                    "must be between 1 and {} seconds",
+                    Self::MAX_ALLOWED_CHARGE_REQUEST_TIMEOUT_SECS
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Structured log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -269,5 +370,64 @@ mod tests {
     fn log_format_defaults_to_json() {
         unsafe { env::remove_var("LOG_FORMAT") };
         assert_eq!(LogFormat::from_env().unwrap(), LogFormat::Json);
+    }
+
+    fn clear_worker_env() {
+        for key in [
+            "WORKER_CONCURRENCY",
+            "WORKER_POLL_INTERVAL_MS",
+            "WORKER_LEASE_DURATION_SECS",
+            "WORKER_CHARGE_SERVICE_URL",
+            "WORKER_CHARGE_REQUEST_TIMEOUT_SECS",
+        ] {
+            unsafe { env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn worker_config_requires_charge_service_url() {
+        clear_worker_env();
+        assert_eq!(
+            WorkerConfig::from_env(),
+            Err(ConfigError::Missing("WORKER_CHARGE_SERVICE_URL"))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn worker_config_applies_defaults() {
+        clear_worker_env();
+        unsafe { env::set_var("WORKER_CHARGE_SERVICE_URL", "http://localhost:8081") };
+        let config = WorkerConfig::from_env().unwrap();
+        assert_eq!(config.concurrency, WorkerConfig::DEFAULT_CONCURRENCY);
+        assert_eq!(
+            config.poll_interval,
+            Duration::from_millis(WorkerConfig::DEFAULT_POLL_INTERVAL_MS)
+        );
+        assert_eq!(
+            config.lease_duration,
+            Duration::from_secs(WorkerConfig::DEFAULT_LEASE_DURATION_SECS)
+        );
+        clear_worker_env();
+    }
+
+    #[test]
+    #[serial]
+    fn worker_config_rejects_non_http_charge_service_url() {
+        clear_worker_env();
+        unsafe { env::set_var("WORKER_CHARGE_SERVICE_URL", "ftp://localhost:8081") };
+        assert!(WorkerConfig::from_env().is_err());
+        clear_worker_env();
+    }
+
+    #[test]
+    #[serial]
+    fn worker_config_rejects_zero_concurrency() {
+        clear_worker_env();
+        unsafe { env::set_var("WORKER_CHARGE_SERVICE_URL", "http://localhost:8081") };
+        unsafe { env::set_var("WORKER_CONCURRENCY", "0") };
+        assert!(WorkerConfig::from_env().is_err());
+        clear_worker_env();
     }
 }
