@@ -150,3 +150,84 @@ crash (the naive per-attempt idempotency key and the naive charge
 service's lack of pre-check both contribute — see M3). Immediate,
 unbounded-severity failure-to-`DEAD` with no retry for what might be a
 transient blip (M4). Unbounded per-worker concurrency (M6).
+
+## M2 — Demonstrate stranded work; add leases
+
+**Invariant.** Invariant 4 (DESIGN.md/SPEC.md sec. 14): "An active
+lease has exactly one token; stale tokens cannot finalize or renew,"
+plus the state machine edge `RUNNING --lease expires--> claimable
+RUNNING by a new owner` (DESIGN.md sec. 3).
+
+**Naive design under test.** M1's `claim_pending_jobs` matched only
+`status = 'PENDING'`. A `RUNNING` row with an expired lease was
+invisible to every future claim — nothing in the system ever looked at
+it again.
+
+**Failure window.** Worker A claims job `J` (`RUNNING`, lease token
+`T`, expiry `now()+30s`) → Worker A crashes before calling
+`finalize_success`/`finalize_dead` → `J` stays `RUNNING` forever; no
+reaper, no reclaim path exists.
+
+**Deterministic reproduction, run against pre-fix code** (see ADR
+0003; full command: `DATABASE_URL=... cargo test -p reliableq-db
+--test leases`):
+
+```text
+running 5 tests
+test two_workers_racing_to_reclaim_dont_double_claim ... FAILED
+test expired_lease_with_exhausted_budget_becomes_dead_not_stranded ... FAILED
+test expired_lease_is_reclaimable_by_a_new_worker ... FAILED
+test stale_worker_cannot_finalize_after_reclaim ... FAILED
+test reclaim_marks_the_abandoned_attempt_as_lease_lost ... FAILED
+
+---- expired_lease_is_reclaimable_by_a_new_worker stdout ----
+assertion `left == right` failed: an expired RUNNING lease must be reclaimable by a new worker
+  left: 0
+ right: 1
+
+---- expired_lease_with_exhausted_budget_becomes_dead_not_stranded stdout ----
+assertion `left == right` failed: it must be DEAD, not left stranded RUNNING with an expired lease
+  left: Running
+ right: Dead
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+**The smallest mechanism (ADR 0003).** Extend `claim_pending_jobs`'s
+`WHERE` clause to also match `status = 'RUNNING' AND lease_expires_at
+<= now()`, under the same `FOR UPDATE SKIP LOCKED` lock as the
+`PENDING` branch. Before that, close out any dangling attempt whose
+lease has expired as `LEASE_LOST`, and move any expired-and-exhausted
+job straight to `DEAD` (it could otherwise never be claimed again and
+would be stranded a different way). Every finalize/renew statement was
+already guarded by `WHERE status = 'RUNNING' AND lease_token = $N`
+(built in M1) — that guard is the actual fencing mechanism token-based
+reclaim relies on; nothing about it needed to change.
+
+**What this still cannot guarantee.** A paused (not dead) worker can
+resume and call the downstream charge service *after* its lease has
+been reclaimed by someone else. Fencing stops it from corrupting the
+job's row, but does not stop the network call — a second charge attempt
+for the same logical job is still possible. Making that overlap safe is
+idempotency's job (M3), explicitly out of scope here.
+
+**Evidence, same tests against the fix:**
+
+```text
+running 5 tests
+test stale_worker_cannot_finalize_after_reclaim ... ok
+test expired_lease_is_reclaimable_by_a_new_worker ... ok
+test two_workers_racing_to_reclaim_dont_double_claim ... ok
+test reclaim_marks_the_abandoned_attempt_as_lease_lost ... ok
+test expired_lease_with_exhausted_budget_becomes_dead_not_stranded ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Full gate (`make gate`): fmt clean, clippy clean, **62 tests passing,
+0 failed** (up from 57 at M1: +5 lease tests).
+
+**Residual risk carried into M3.** The exact overlap ADR 0003 names
+above — a resumed, paused worker's charge call racing a reclaiming
+worker's charge call — is the concrete mechanism M3's duplicate-charge
+reproduction exercises.

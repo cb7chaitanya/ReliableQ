@@ -1,8 +1,11 @@
 //! reliableq-worker: claims due jobs and executes them against
-//! fake-charge. M1 scope only — see `docs/failure-lab.md` M1/M2/M3/M4
-//! entries for the gaps this milestone leaves open on purpose:
+//! fake-charge. Crash recovery is now real (M2): `claim_pending_jobs`
+//! reclaims expired leases and closes out the abandoned attempt as
+//! `LEASE_LOST`, and a stale worker's own finalize attempt is rejected
+//! by the token-fenced guard below — that is why the `Ok(false)`
+//! branches here only log, they do not need to write `LEASE_LOST`
+//! themselves. Remaining gaps, see `docs/failure-lab.md`:
 //!
-//! - no expired-lease reclaim (a crash here strands the job until M2)
 //! - the charge idempotency key is scoped per *attempt*, not per job
 //!   (M3 makes it job-scoped and adds graceful replay)
 //! - any execution failure goes straight to `DEAD`, no retry (M4)
