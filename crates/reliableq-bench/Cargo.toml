@@ -1,0 +1,29 @@
+[package]
+name = "reliableq-bench"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "reliableq-bench"
+path = "src/main.rs"
+
+[dependencies]
+reliableq-core = { path = "../reliableq-core" }
+reliableq-db = { path = "../reliableq-db" }
+reliableq-worker = { path = "../reliableq-worker" }
+tokio = { workspace = true, features = ["process"] }
+sqlx.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series", "point_series"] }
