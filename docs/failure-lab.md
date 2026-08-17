@@ -231,3 +231,90 @@ Full gate (`make gate`): fmt clean, clippy clean, **62 tests passing,
 above — a resumed, paused worker's charge call racing a reclaiming
 worker's charge call — is the concrete mechanism M3's duplicate-charge
 reproduction exercises.
+
+## M3 — Demonstrate duplicate effect; add idempotency
+
+**Invariant.** Invariant 12 (SPEC.md sec. 14): "A crash after a
+committed charge but before job finalization can cause re-execution,
+but not a duplicate charge." Invariants 10-11: the charge service
+creates at most one charge per idempotency key, and reusing a key for
+different input never silently succeeds.
+
+**Naive design under test.** The worker derived its idempotency key as
+`reliableq:charge:<job_id>:attempt:<n>` — different on every attempt.
+`fake-charge`'s `insert_charge` did a plain `INSERT`, relying entirely
+on the table's unique constraint, which only helps if the *same* key is
+ever sent twice.
+
+**Failure window.** Worker A claims job `J` (attempt 1) → calls
+`fake-charge` with key `...attempt:1` → charge commits, one row exists
+→ Worker A crashes before calling `finalize_success` → `J`'s lease
+expires (M2) → Worker B reclaims `J` (attempt 2) → calls `fake-charge`
+with key `...attempt:2` (different key!) → charge commits *again* → two
+charge rows exist for one logical job.
+
+**Deterministic reproduction, run against pre-fix code**
+(`crates/reliableq-worker/tests/duplicate_charge.rs`, driving
+`execute_charge` directly for each attempt with no finalize in
+between):
+
+```text
+running 1 test
+test crash_after_charge_before_finalize_then_retry_produces_one_charge ... FAILED
+
+thread '...' panicked:
+assertion `left == right` failed: re-executing the same job must produce exactly one charge (invariant 12)
+  left: 2
+ right: 1
+
+test result: FAILED. 0 passed; 1 failed
+```
+
+**The smallest mechanism (ADR 0004).** Two changes, together:
+
+1. Worker: derive the idempotency key from the job ID alone
+   (`reliableq_core::idempotency::charge_idempotency_key`), constant
+   across every attempt.
+2. `fake-charge`: replace the plain `INSERT` with
+   `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`
+   (`reliableq_db::charges::insert_or_get_charge`) — one atomic
+   statement, no separate check-then-insert race window. If it returns
+   a row, this call created the charge (`201`). If not, fetch the
+   existing row and compare payloads: same payload → replay (`200`,
+   `replayed: true`); different payload → `409 IDEMPOTENCY_CONFLICT`.
+
+**What this still cannot guarantee.** Job *execution* is still not
+exactly-once (ADR 0002) — the worker still calls the charge service
+twice in the scenario above. What changed is that the second call is
+now provably a no-op from the customer's point of view. A job handler
+without an idempotent downstream (i.e. any handler other than the one
+bundled here) does not inherit this property automatically.
+
+**Evidence, same test against the fix, plus new coverage:**
+
+```text
+crates/reliableq-worker/tests/duplicate_charge.rs
+  test crash_after_charge_before_finalize_then_retry_produces_one_charge ... ok
+
+crates/fake-charge/tests/charges.rs (6 tests)
+  reused_idempotency_key_with_same_payload_replays ... ok
+  reused_idempotency_key_with_different_payload_is_a_conflict ... ok
+  concurrent_duplicate_requests_produce_one_charge_row ... ok
+  (+ 3 existing: first_charge_returns_201, missing key, invalid payload)
+
+crates/reliableq-db/tests/charges.rs (6 tests)
+  reusing_a_key_with_the_same_payload_replays ... ok
+  reusing_a_key_with_a_different_payload_is_a_conflict ... ok
+  concurrent_inserts_with_the_same_key_produce_one_row ... ok
+  (+ 3 existing: round trip, missing key, first-insert)
+```
+
+Full gate (`make gate`): fmt clean, clippy clean, **71 tests passing,
+0 failed** (up from 62 at M2: +5 attempt-scoped-key removal net, +6
+fake-charge, +3 reliableq-db charges, +1 worker reproduction, -3
+superseded M1 tests documenting the now-fixed naive behavior).
+
+**Residual risk carried into M4.** Every execution failure — including
+genuinely transient ones (timeout, `503`) — still goes straight to
+`DEAD` with no retry. The failure taxonomy (transient/permanent/
+ambiguous) and backoff schedule do not exist yet.
