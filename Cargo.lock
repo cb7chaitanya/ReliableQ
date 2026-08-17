@@ -357,6 +357,22 @@ dependencies = [
 [[package]]
 name = "fake-charge"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "http-body-util",
+ "reliableq-core",
+ "reliableq-db",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "find-msvc-tools"

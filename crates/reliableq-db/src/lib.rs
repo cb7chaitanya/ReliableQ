@@ -2,6 +2,7 @@
 //! functions shared by every binary that talks to PostgreSQL.
 
 pub mod attempts;
+pub mod charges;
 pub mod jobs;
 
 use reliableq_core::config::DatabaseConfig;
