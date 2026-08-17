@@ -1,13 +1,12 @@
 //! Stable error envelope (spec sec. 8): `{ "error": { code, message,
-//! request_id } }`. `request_id` is a fresh UUID per error response for
-//! now; M7 wires this to the per-request correlation ID introduced with
-//! tracing middleware.
+//! request_id } }`. `request_id` is the per-request correlation ID from
+//! `crate::correlation` (spec sec. 13.3), the same one attached to this
+//! request's logs and echoed as the `X-Request-Id` response header.
 
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
-use uuid::Uuid;
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
@@ -60,7 +59,7 @@ impl IntoResponse for ApiError {
             error: ErrorDetail {
                 code: self.code,
                 message: self.message,
-                request_id: Uuid::new_v4().to_string(),
+                request_id: crate::correlation::current_request_id(),
             },
         };
         (self.status, Json(body)).into_response()

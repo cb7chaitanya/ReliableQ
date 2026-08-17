@@ -25,6 +25,8 @@ uuid.workspace = true
 chrono.workspace = true
 base64.workspace = true
 tower = { version = "0.5", features = ["timeout", "util"] }
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

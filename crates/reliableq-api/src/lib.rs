@@ -1,19 +1,18 @@
 //! reliableq-api: validates submissions, persists jobs, and exposes
 //! read/list/retry endpoints, health probes, and Prometheus metrics.
-//!
-//! The retry endpoint (sec. 8.3) and `/metrics` (sec. 13.2) land in
-//! M5/M7; this crate currently wires up submit/get/list, health probes,
-//! and app-level body-size/timeout bounds.
 
+pub mod correlation;
 pub mod error;
 pub mod health;
 pub mod jobs;
+pub mod metrics;
 
 use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::{BoxError, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use tower::ServiceBuilder;
 use tower::timeout::TimeoutLayer;
@@ -23,6 +22,16 @@ use crate::error::ApiError;
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
+    pub metrics_handle: PrometheusHandle,
+}
+
+impl AppState {
+    pub fn new(db: PgPool) -> Self {
+        Self {
+            db,
+            metrics_handle: metrics::recorder_handle(),
+        }
+    }
 }
 
 pub fn build_app(state: AppState, max_body_bytes: usize, request_timeout: Duration) -> Router {
@@ -35,8 +44,10 @@ pub fn build_app(state: AppState, max_body_bytes: usize, request_timeout: Durati
     Router::new()
         .merge(health::routes())
         .merge(jobs::routes())
+        .merge(metrics::routes())
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(timeout)
+        .layer(axum::middleware::from_fn(correlation::middleware))
         .with_state(state)
 }
 

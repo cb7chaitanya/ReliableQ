@@ -1,0 +1,55 @@
+//! Request ID correlation (spec sec. 13.3): every request gets an ID —
+//! reused from an inbound `X-Request-Id` header if the caller supplied
+//! one, minted fresh otherwise — attached to every log line for that
+//! request via a tracing span, echoed back as a response header, and
+//! used as the error envelope's `request_id` (spec sec. 8) instead of
+//! an unrelated fresh UUID per error.
+
+use axum::extract::Request;
+use axum::http::HeaderValue;
+use axum::middleware::Next;
+use axum::response::Response;
+use tracing::Instrument;
+use uuid::Uuid;
+
+const HEADER_NAME: &str = "x-request-id";
+
+tokio::task_local! {
+    static REQUEST_ID: String;
+}
+
+/// The current request's correlation ID, if called from within
+/// [`middleware`]'s scope (always true for a normal handler/error
+/// path). Falls back to a fresh ID rather than panicking if called
+/// outside that scope, so it stays safe to use from anywhere.
+pub fn current_request_id() -> String {
+    REQUEST_ID
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| Uuid::new_v4().to_string())
+}
+
+pub async fn middleware(mut request: Request, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get(HEADER_NAME)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        request.headers_mut().insert(HEADER_NAME, value.clone());
+    }
+
+    let span = tracing::info_span!("request", request_id = %request_id);
+    let request_id_for_response = request_id.clone();
+
+    let mut response = REQUEST_ID
+        .scope(request_id, next.run(request).instrument(span))
+        .await;
+
+    if let Ok(value) = HeaderValue::from_str(&request_id_for_response) {
+        response.headers_mut().insert(HEADER_NAME, value);
+    }
+    response
+}

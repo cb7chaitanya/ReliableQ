@@ -148,6 +148,7 @@ async fn submit_job(
     let id = Uuid::new_v4();
     let row = jobs::insert_job(&state.db, id, &body.kind, &body.payload, body.max_attempts).await?;
     let status = row.status()?;
+    metrics::counter!("reliableq_jobs_submitted_total", "kind" => row.kind.clone()).increment(1);
 
     Ok((
         StatusCode::ACCEPTED,

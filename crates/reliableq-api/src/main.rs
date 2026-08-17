@@ -24,10 +24,15 @@ async fn main() -> anyhow::Result<()> {
     run_migrations(&db).await?;
 
     let app = build_app(
-        AppState { db },
+        AppState::new(db.clone()),
         http_config.max_body_bytes,
         http_config.request_timeout,
     );
+
+    let gauge_refresher = tokio::spawn(reliableq_api::metrics::run_gauge_refresher(
+        db,
+        reliableq_api::metrics::recorder_handle(),
+    ));
 
     tracing::info!(addr = %http_config.bind_addr, "starting reliableq-api");
     let listener = tokio::net::TcpListener::bind(http_config.bind_addr).await?;
@@ -35,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    gauge_refresher.abort();
     Ok(())
 }
 

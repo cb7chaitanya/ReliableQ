@@ -64,9 +64,7 @@ impl TestDb {
 
     fn app(&self) -> Router {
         build_app(
-            AppState {
-                db: self.pool.clone(),
-            },
+            AppState::new(self.pool.clone()),
             64 * 1024,
             Duration::from_secs(10),
         )

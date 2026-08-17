@@ -6,6 +6,7 @@
 
 pub mod chaos;
 pub mod charges;
+pub mod correlation;
 pub mod error;
 
 use std::time::Duration;
@@ -46,6 +47,7 @@ pub fn build_app(
     router
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(timeout)
+        .layer(axum::middleware::from_fn(correlation::middleware))
         .with_state(state)
 }
 

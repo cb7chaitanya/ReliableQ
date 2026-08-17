@@ -73,7 +73,7 @@ impl Harness {
         .await;
 
         let api_addr = spawn_app(reliableq_api::build_app(
-            reliableq_api::AppState { db: pool.clone() },
+            reliableq_api::AppState::new(pool.clone()),
             64 * 1024,
             Duration::from_secs(10),
         ))

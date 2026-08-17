@@ -10,7 +10,7 @@ use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
 fn test_app(db: sqlx::PgPool) -> Router {
-    build_app(AppState { db }, 64 * 1024, Duration::from_secs(10))
+    build_app(AppState::new(db), 64 * 1024, Duration::from_secs(10))
 }
 
 #[tokio::test]
