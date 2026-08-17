@@ -71,7 +71,8 @@ async fn create_charge(
     let key = idempotency_key(&headers)?;
     let payload = parse_charge_payload(&body)?;
 
-    if let crate::chaos::ChaosDecision::Reject(status) = state.chaos.decide() {
+    let _inflight_guard = state.chaos.track_inflight();
+    if let crate::chaos::ChaosDecision::Reject(status) = state.chaos.decide().await {
         return Err(ApiError::new(
             status,
             "INJECTED_FAILURE",

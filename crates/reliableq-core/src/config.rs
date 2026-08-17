@@ -172,6 +172,10 @@ pub struct WorkerConfig {
     pub retry_base_delay: Duration,
     pub retry_multiplier: u32,
     pub retry_max_delay: Duration,
+    /// How long shutdown waits for an in-flight batch to finish before
+    /// abandoning it (spec sec. 9.5). Abandoned work is never marked
+    /// successful; its lease simply expires and becomes reclaimable.
+    pub shutdown_grace: Duration,
 }
 
 impl WorkerConfig {
@@ -182,11 +186,13 @@ impl WorkerConfig {
     pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1_000;
     pub const DEFAULT_RETRY_MULTIPLIER: u32 = 2;
     pub const DEFAULT_RETRY_MAX_DELAY_SECS: u64 = 60;
+    pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
     const MAX_ALLOWED_CONCURRENCY: usize = 1000;
     const MAX_ALLOWED_POLL_INTERVAL_MS: u64 = 60_000;
     const MAX_ALLOWED_LEASE_DURATION_SECS: u64 = 3600;
     const MAX_ALLOWED_CHARGE_REQUEST_TIMEOUT_SECS: u64 = 120;
     const MAX_ALLOWED_RETRY_MAX_DELAY_SECS: u64 = 3600;
+    const MAX_ALLOWED_SHUTDOWN_GRACE_SECS: u64 = 3600;
 
     pub fn from_env() -> Result<Self, ConfigError> {
         let concurrency = parse_env("WORKER_CONCURRENCY", Self::DEFAULT_CONCURRENCY)?;
@@ -212,6 +218,10 @@ impl WorkerConfig {
             "WORKER_RETRY_MAX_DELAY_SECS",
             Self::DEFAULT_RETRY_MAX_DELAY_SECS,
         )?;
+        let shutdown_grace_secs = parse_env(
+            "WORKER_SHUTDOWN_GRACE_SECS",
+            Self::DEFAULT_SHUTDOWN_GRACE_SECS,
+        )?;
 
         let config = Self {
             concurrency,
@@ -222,6 +232,7 @@ impl WorkerConfig {
             retry_base_delay: Duration::from_millis(retry_base_delay_ms),
             retry_multiplier,
             retry_max_delay: Duration::from_secs(retry_max_delay_secs),
+            shutdown_grace: Duration::from_secs(shutdown_grace_secs),
         };
         config.validate()?;
         Ok(config)
@@ -308,6 +319,15 @@ impl WorkerConfig {
             return Err(invalid(
                 "WORKER_RETRY_BASE_DELAY_MS",
                 "must not exceed WORKER_RETRY_MAX_DELAY_SECS",
+            ));
+        }
+        if self.shutdown_grace > Duration::from_secs(Self::MAX_ALLOWED_SHUTDOWN_GRACE_SECS) {
+            return Err(invalid(
+                "WORKER_SHUTDOWN_GRACE_SECS",
+                format!(
+                    "must be at most {} seconds",
+                    Self::MAX_ALLOWED_SHUTDOWN_GRACE_SECS
+                ),
             ));
         }
         Ok(())
