@@ -1343,8 +1343,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "reliableq-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "fake-charge",
+ "reliableq-api",
+ "reliableq-core",
+ "reliableq-db",
+ "reliableq-worker",
+ "reqwest",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "reliableq-worker"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rand 0.8.7",
+ "reliableq-core",
+ "reliableq-db",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "reqwest"
