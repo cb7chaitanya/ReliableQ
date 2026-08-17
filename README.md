@@ -6,14 +6,13 @@ machine, [`SPEC.md`](SPEC.md) for the full implementation brief, and
 [`docs/failure-lab.md`](docs/failure-lab.md) for the milestone-by-
 milestone reasoning trail.
 
-> Status: M6 (bounded concurrency and graceful shutdown) complete — a
-> worker's in-flight downstream calls are capped by a semaphore with
-> measured evidence, long-running jobs renew their own lease, and
-> shutdown drains in-flight work within a grace period without ever
-> marking abandoned work successful. Full observability (metrics,
-> correlation IDs) and the seeded chaos suite are not implemented yet
-> by design; see `docs/failure-lab.md` for what's proven so far and
-> what each milestone still owes.
+> Status: M7 (observability and operational polish) complete — the API
+> and worker each expose `/metrics`, structured logs carry `worker_id`
+> and a redacted `lease_token_hash`, and requests carry a correlation
+> ID from the API through to fake-charge. See
+> [`docs/operations.md`](docs/operations.md) for day-to-day procedures.
+> The seeded chaos suite (M8) is not implemented yet; see
+> `docs/failure-lab.md` for what's proven so far.
 
 ## Quick start
 
