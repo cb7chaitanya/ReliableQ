@@ -612,3 +612,95 @@ been demonstrated *individually*. None has been run *together*, under
 seeded randomness, with multiple concurrent workers, across process
 crashes — the actual chaos suite the spec's test plan (sec. 17) calls
 for does not exist yet.
+
+## M8 — Chaos suite, hardening, and narrative
+
+**Goal.** SPEC.md sec. 17: seeded random injection across >=100 jobs
+and multiple workers, checking invariants directly against PostgreSQL
+after quiescence; at least one scenario where a lease expires while
+the old worker is paused. SPEC.md sec. 21: finish README, ADRs, blog,
+demo script.
+
+**The mechanism.** A trait-based failpoint interface
+(`reliableq_worker::failpoint::Failpoints`) checked at the three named
+crash points (spec sec. 12), with `execute_and_finalize` — the only
+function the real poll loop calls — remaining a thin wrapper that
+always passes `NoopFailpoints`. The chaos suite
+(`tests/chaos/seeded_chaos.rs`) submits 120 jobs, runs 3 concurrent
+simulated workers through repeated claim/execute rounds against a
+250ms lease, triggers all three failpoints at a seeded 12% probability
+per job, and drives a real 40-request burst of transient `503`s early
+in the run. After quiescence (polled with a bounded deadline, never a
+fixed sleep), it asserts directly against PostgreSQL: every job
+terminal, none over its retry budget, none lost/duplicated as a job,
+and — the sharpest check — no idempotency key backing more than one
+charge row.
+
+**Evidence.**
+
+```text
+seeded_chaos_suite: SEED=20260817 JOB_COUNT=120 WORKER_COUNT=3
+seeded_chaos_suite: stopped after 35 rounds, reached_quiescence=true
+seeded_chaos_suite: SEED=20260817 rounds=35 succeeded=114 dead=6 total=120
+test seeded_chaos_suite_converges_and_holds_every_invariant ... ok
+```
+
+Stable across 3 repeated runs (32-50 rounds, 114-116 succeeded,
+1.6-2.5s wall time each — round count varies because real async
+scheduling isn't fully deterministic even with a seeded RNG; the seed
+reproduces the *failpoint decisions*, not wall-clock timing) and a
+second, unrelated seed (`424242`): zero invariant violations in every
+run. See `docs/blog/05-chaos-results.md` for the full walkthrough,
+including the exact event sequence when `AfterEffectBeforeFinalize`
+fires — the concrete "lease expires while the old worker is paused"
+scenario spec sec. 17 asks for explicitly.
+
+**Bugs found by actually running things, not just writing tests for
+them.** Two real bugs surfaced while producing this milestone's other
+deliverable, `scripts/demo.sh` — worth recording precisely because
+neither was caught by the (passing, green) test suite:
+
+1. Every chaos-control `curl` call in the first draft of the demo
+   script omitted `Content-Type: application/json`. Axum's `Json`
+   extractor silently rejects such a request; because the script
+   piped control-call output to `/dev/null`, every injected failure
+   mode (transient 503s, delayed responses, permanent rejection)
+   silently never activated — every "chaos" step just showed a job
+   succeeding normally. Fixed by adding a `chaos_control()` helper
+   that sets the header and asserts on the HTTP status.
+2. The script captured `$!` after `cargo run -p X &`, which is `cargo`
+   run's own wrapper process, not the server process it spawns as a
+   child. `kill -9` on that PID killed the wrapper; the actual server
+   kept running, orphaned. This made the "worker crash" demo step a
+   no-op — the job just finished normally because the "killed" worker
+   was still alive. Fixed by exec'ing the built binaries directly
+   (`./target/debug/X`) instead of through `cargo run`.
+3. A genuine production bug, unrelated to the script: the API log
+   showed `oldest_pending_age_seconds` failing to refresh every 5s —
+   `EXTRACT(EPOCH FROM ...)` returns Postgres `NUMERIC`, and sqlx's
+   `f64` decode was silently failing against it (logged as a warning,
+   never crashing, gauge simply never updated). Fixed with an explicit
+   `::float8` cast; see the `fix:` commit for this milestone.
+
+None of these were caught by `cargo test` — the test suite exercises
+the library code the binaries call, not the deployed-and-actually-run
+binaries wired together with real shell scripting. This is the
+concrete argument for actually running the demo end to end rather than
+trusting that a green test suite implies a working demo script.
+
+**Full gate, final state:**
+
+```text
+cargo fmt --all -- --check              -> clean
+cargo clippy --workspace --all-targets \
+  --all-features -- -D warnings         -> clean, 0 warnings
+cargo test --workspace --all-features   -> 107 passed; 0 failed
+```
+
+**What remains honestly unproven** (see `docs/interview-notes.md`
+"Honest production extensions" and `docs/blog/05-chaos-results.md`
+"What's still not covered"): `Retry-After` handling, a true end-to-end
+distributed trace ID, retention/archival, authentication, and
+fleet-wide (cross-process) concurrency limiting. All are explicit
+non-goals or deliberately deferred, documented rather than silently
+absent.
