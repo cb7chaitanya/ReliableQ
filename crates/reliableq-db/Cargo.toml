@@ -10,7 +10,8 @@ publish.workspace = true
 reliableq-core.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 uuid.workspace = true
