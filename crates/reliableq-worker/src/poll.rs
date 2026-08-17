@@ -26,6 +26,12 @@ const CLAIM_BATCH_MAX: i64 = 10;
 /// returning. Never claims more than the configured concurrency allows
 /// (spec sec. 9.5) and never claims anything at all once `shutdown` has
 /// fired.
+///
+/// `#[instrument]` attaches `worker_id` to every log event emitted from
+/// this function and everything it calls (spec sec. 13.1: structured
+/// logs must carry `worker_id`), without threading it through every
+/// function signature by hand.
+#[tracing::instrument(skip_all, fields(worker_id = %worker_id))]
 pub async fn run_worker_loop(
     pool: &PgPool,
     client: &Client,

@@ -8,11 +8,13 @@
 //! idempotency key is derived deterministically per job. Failures are
 //! classified and, if retryable, scheduled with capped exponential
 //! backoff and full jitter (M4). Dead jobs are explicitly replayable,
-//! never auto-reclaimed (M5). Concurrency is now bounded by a semaphore
-//! and long-running jobs get periodic lease renewal so a slow
-//! downstream call doesn't let the lease expire out from under
-//! legitimately in-progress work (M6).
+//! never auto-reclaimed (M5). Concurrency is bounded by a semaphore and
+//! long-running jobs get periodic lease renewal (M6). Every log line
+//! that touches a lease logs its redacted hash, never the raw token
+//! (spec sec. 13.1), and every terminal transition is reflected in a
+//! Prometheus metric (spec sec. 13.2, M7).
 
+pub mod metrics_server;
 pub mod poll;
 
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use std::time::{Duration, Instant};
 
 pub use poll::run_worker_loop;
 use reliableq_core::failure::{FailureClass, classify_http_status, classify_network_error};
+use reliableq_core::redact::lease_token_hash;
 use reliableq_core::retry::RetryPolicy;
 use reliableq_core::validation::parse_charge_payload;
 use reliableq_db::jobs::{self, ClaimedJob};
@@ -27,6 +30,7 @@ use reqwest::Client;
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -53,6 +57,11 @@ pub fn spawn_bounded_batch(
     semaphore: Arc<Semaphore>,
     claimed: Vec<ClaimedJob>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    // Spawned tasks don't inherit the caller's tracing span
+    // automatically; capturing it here and instrumenting each task is
+    // what keeps `worker_id` (attached to run_worker_loop's span) on
+    // every log line the task emits (spec sec. 13.1).
+    let span = tracing::Span::current();
     claimed
         .into_iter()
         .map(|job| {
@@ -60,24 +69,35 @@ pub fn spawn_bounded_batch(
             let client = client.clone();
             let charge_service_url = charge_service_url.clone();
             let semaphore = semaphore.clone();
-            tokio::spawn(async move {
-                let Ok(_permit) = semaphore.acquire_owned().await else {
-                    // Semaphore is only ever closed at process shutdown
-                    // after all permits are already accounted for; this
-                    // is unreachable in practice but must not panic.
-                    tracing::error!(job_id = %job.job.id, "semaphore closed before permit acquired");
-                    return;
-                };
-                execute_and_finalize(
-                    &pool,
-                    &client,
-                    &charge_service_url,
-                    &retry_policy,
-                    lease_duration,
-                    job,
-                )
-                .await;
-            })
+            let span = span.clone();
+            tokio::spawn(
+                async move {
+                    if job.was_reclaimed {
+                        metrics::counter!("reliableq_lease_expirations_reclaimed_total")
+                            .increment(1);
+                    }
+                    let Ok(_permit) = semaphore.acquire_owned().await else {
+                        // Semaphore is only ever closed at process
+                        // shutdown after all permits are already
+                        // accounted for; unreachable in practice but
+                        // must not panic.
+                        tracing::error!(job_id = %job.job.id, "semaphore closed before permit acquired");
+                        return;
+                    };
+                    metrics::gauge!("reliableq_inflight_jobs").increment(1.0);
+                    execute_and_finalize(
+                        &pool,
+                        &client,
+                        &charge_service_url,
+                        &retry_policy,
+                        lease_duration,
+                        job,
+                    )
+                    .await;
+                    metrics::gauge!("reliableq_inflight_jobs").decrement(1.0);
+                }
+                .instrument(span),
+            )
         })
         .collect()
 }
@@ -104,23 +124,35 @@ pub async fn execute_and_finalize(
         tracing::error!(job_id = %job.id, "claimed job unexpectedly has no lease token");
         return;
     };
+    let token_hash = lease_token_hash(lease_token);
 
     let heartbeat = spawn_heartbeat(pool.clone(), job.id, lease_token, lease_duration);
 
     let start = Instant::now();
     let outcome = execute_charge(client, charge_service_url, job.id, &job.payload).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let duration_secs = start.elapsed().as_secs_f64();
     heartbeat.abort();
 
     match outcome {
         Ok(()) => match jobs::finalize_success(pool, job.id, lease_token, duration_ms).await {
             Ok(true) => {
-                tracing::info!(job_id = %job.id, attempt = attempt_number, "job succeeded");
+                tracing::info!(
+                    job_id = %job.id,
+                    attempt = attempt_number,
+                    lease_token_hash = %token_hash,
+                    "job succeeded"
+                );
+                metrics::counter!("reliableq_job_attempts_total", "kind" => job.kind.clone(), "outcome" => "SUCCEEDED")
+                    .increment(1);
+                metrics::histogram!("reliableq_job_duration_seconds", "kind" => job.kind.clone(), "outcome" => "SUCCEEDED")
+                    .record(duration_secs);
             }
             Ok(false) => {
                 tracing::warn!(
                     job_id = %job.id,
                     attempt = attempt_number,
+                    lease_token_hash = %token_hash,
                     "lease lost before success could be finalized"
                 );
             }
@@ -150,13 +182,21 @@ pub async fn execute_and_finalize(
                         attempt = attempt_number,
                         code = failure.code,
                         delay_ms = delay.as_millis() as u64,
+                        lease_token_hash = %token_hash,
                         "job failed with a retryable error, rescheduled"
                     );
+                    metrics::counter!("reliableq_job_attempts_total", "kind" => job.kind.clone(), "outcome" => "RETRY_SCHEDULED")
+                        .increment(1);
+                    metrics::counter!("reliableq_retries_scheduled_total", "reason" => failure.code)
+                        .increment(1);
+                    metrics::histogram!("reliableq_job_duration_seconds", "kind" => job.kind.clone(), "outcome" => "RETRY_SCHEDULED")
+                        .record(duration_secs);
                 }
                 Ok(false) => {
                     tracing::warn!(
                         job_id = %job.id,
                         attempt = attempt_number,
+                        lease_token_hash = %token_hash,
                         "lease lost before retry could be scheduled"
                     );
                 }
@@ -186,13 +226,20 @@ pub async fn execute_and_finalize(
                         job_id = %job.id,
                         attempt = attempt_number,
                         code = reason,
+                        lease_token_hash = %token_hash,
                         "job failed permanently and moved to DEAD"
                     );
+                    metrics::counter!("reliableq_job_attempts_total", "kind" => job.kind.clone(), "outcome" => "DEAD")
+                        .increment(1);
+                    metrics::counter!("reliableq_dead_jobs_total", "reason" => reason).increment(1);
+                    metrics::histogram!("reliableq_job_duration_seconds", "kind" => job.kind.clone(), "outcome" => "DEAD")
+                        .record(duration_secs);
                 }
                 Ok(false) => {
                     tracing::warn!(
                         job_id = %job.id,
                         attempt = attempt_number,
+                        lease_token_hash = %token_hash,
                         "lease lost before failure could be finalized"
                     );
                 }
@@ -214,19 +261,30 @@ fn spawn_heartbeat(
     lease_duration: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let interval = (lease_duration / 3).max(Duration::from_millis(100));
+    let token_hash = lease_token_hash(lease_token);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
             match jobs::renew_lease(&pool, job_id, lease_token, lease_duration).await {
                 Ok(true) => {
-                    tracing::debug!(job_id = %job_id, "lease renewed");
+                    tracing::debug!(job_id = %job_id, lease_token_hash = %token_hash, "lease renewed");
+                    metrics::counter!("reliableq_lease_renewals_total", "result" => "ok")
+                        .increment(1);
                 }
                 Ok(false) => {
-                    tracing::warn!(job_id = %job_id, "lease renewal found the lease already gone");
+                    tracing::warn!(
+                        job_id = %job_id,
+                        lease_token_hash = %token_hash,
+                        "lease renewal found the lease already gone"
+                    );
+                    metrics::counter!("reliableq_lease_renewals_total", "result" => "lost")
+                        .increment(1);
                     break;
                 }
                 Err(err) => {
                     tracing::error!(job_id = %job_id, error = %err, "lease renewal failed");
+                    metrics::counter!("reliableq_lease_renewals_total", "result" => "error")
+                        .increment(1);
                 }
             }
         }
@@ -254,10 +312,16 @@ pub async fn execute_charge(
     // this same job sends the same key, so a re-execution after a
     // lease reclaim (M2) replays instead of duplicating (M3).
     let idempotency_key = reliableq_core::idempotency::charge_idempotency_key(job_id);
+    // Correlates this call with the job across the worker's own logs
+    // and fake-charge's (spec sec. 13.3); not a true end-to-end trace
+    // from the original API request, which would require a request_id
+    // captured at submission time and stored on the job row.
+    let request_id = format!("job:{job_id}");
 
     let response = client
         .post(format!("{charge_service_url}/v1/charges"))
         .header("Idempotency-Key", idempotency_key)
+        .header("X-Request-Id", &request_id)
         .json(&json!({
             "customer_id": charge_payload.customer_id,
             "amount_cents": charge_payload.amount_cents,
@@ -265,17 +329,29 @@ pub async fn execute_charge(
         }))
         .send()
         .await
-        .map_err(|err| ExecutionFailure {
-            class: classify_network_error(),
-            code: "DOWNSTREAM_UNREACHABLE",
-            message: err.to_string(),
+        .map_err(|err| {
+            metrics::counter!("reliableq_downstream_requests_total", "result" => "unreachable")
+                .increment(1);
+            ExecutionFailure {
+                class: classify_network_error(),
+                code: "DOWNSTREAM_UNREACHABLE",
+                message: err.to_string(),
+            }
         })?;
 
     if response.status().is_success() {
+        metrics::counter!("reliableq_downstream_requests_total", "result" => "success")
+            .increment(1);
         Ok(())
     } else {
         let status = response.status();
         let class = classify_http_status(status.as_u16());
+        let result = match class {
+            FailureClass::Transient => "transient",
+            FailureClass::Permanent => "permanent",
+            FailureClass::Ambiguous => "ambiguous",
+        };
+        metrics::counter!("reliableq_downstream_requests_total", "result" => result).increment(1);
         let body = response.text().await.unwrap_or_default();
         Err(ExecutionFailure {
             class,

@@ -23,7 +23,9 @@ sqlx.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 rand.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+axum.workspace = true
 
 [dev-dependencies]
 fake-charge = { path = "../fake-charge" }
-axum.workspace = true

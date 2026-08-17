@@ -33,11 +33,19 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         worker_id = %worker_id,
         concurrency = worker_config.concurrency,
+        metrics_addr = %worker_config.metrics_bind_addr,
         "starting reliableq-worker"
     );
 
+    let metrics_handle = reliableq_worker::metrics_server::recorder_handle();
+    let metrics_server = tokio::spawn(reliableq_worker::metrics_server::serve(
+        worker_config.metrics_bind_addr,
+        metrics_handle,
+    ));
+
     run_worker_loop(&db, &client, &worker_id, &worker_config, shutdown_signal()).await;
 
+    metrics_server.abort();
     tracing::info!("worker shutting down");
     Ok(())
 }

@@ -99,6 +99,7 @@ impl Harness {
             retry_multiplier: 2,
             retry_max_delay: Duration::from_secs(60),
             shutdown_grace,
+            metrics_bind_addr: "127.0.0.1:0".parse().unwrap(),
         }
     }
 }
