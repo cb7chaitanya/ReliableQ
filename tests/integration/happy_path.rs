@@ -132,6 +132,7 @@ impl Harness {
                 &self.client,
                 &charge_url,
                 &retry_policy,
+                Duration::from_secs(30),
                 job,
             )
             .await;

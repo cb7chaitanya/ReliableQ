@@ -1,15 +1,8 @@
-use std::time::Duration;
-
-use rand::Rng;
 use reliableq_core::config::{DatabaseConfig, LogFormat, WorkerConfig};
-use reliableq_db::{create_pool, jobs, run_migrations};
-use reliableq_worker::execute_and_finalize;
+use reliableq_db::{create_pool, run_migrations};
+use reliableq_worker::run_worker_loop;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
-/// Claimed per poll cycle. Not yet tied to `WorkerConfig::concurrency`
-/// (that bound lands in M6); this just caps one round-trip's work.
-const CLAIM_BATCH_SIZE: i64 = 10;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,53 +30,13 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let worker_id = format!("worker-{}", Uuid::new_v4());
-    let retry_policy = worker_config.retry_policy();
-    tracing::info!(worker_id = %worker_id, "starting reliableq-worker");
+    tracing::info!(
+        worker_id = %worker_id,
+        concurrency = worker_config.concurrency,
+        "starting reliableq-worker"
+    );
 
-    let mut shutdown = std::pin::pin!(shutdown_signal());
-    loop {
-        let claimed = match jobs::claim_pending_jobs(
-            &db,
-            &worker_id,
-            CLAIM_BATCH_SIZE,
-            worker_config.lease_duration,
-        )
-        .await
-        {
-            Ok(claimed) => claimed,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to claim jobs, backing off");
-                Vec::new()
-            }
-        };
-
-        if claimed.is_empty() {
-            // Full-jitter idle poll (spec sec. 9.5): avoids a
-            // synchronized fleet of workers all polling in lockstep.
-            // Only interruptible here, between cycles — M1 does not
-            // interrupt in-flight execution for shutdown (that grace
-            // period lands in M6).
-            let jitter_ms =
-                rand::thread_rng().gen_range(0..=worker_config.poll_interval.as_millis() as u64);
-            let wait = worker_config.poll_interval + Duration::from_millis(jitter_ms);
-            tokio::select! {
-                _ = &mut shutdown => break,
-                _ = tokio::time::sleep(wait) => {}
-            }
-            continue;
-        }
-
-        for claimed_job in claimed {
-            execute_and_finalize(
-                &db,
-                &client,
-                &worker_config.charge_service_url,
-                &retry_policy,
-                claimed_job,
-            )
-            .await;
-        }
-    }
+    run_worker_loop(&db, &client, &worker_id, &worker_config, shutdown_signal()).await;
 
     tracing::info!("worker shutting down");
     Ok(())

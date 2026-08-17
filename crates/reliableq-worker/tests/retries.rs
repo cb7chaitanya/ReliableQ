@@ -139,6 +139,7 @@ async fn run_one_cycle(harness: &Harness, retry_policy: &RetryPolicy) -> usize {
             &harness.client,
             &harness.charge_url,
             retry_policy,
+            Duration::from_secs(30),
             job,
         )
         .await;

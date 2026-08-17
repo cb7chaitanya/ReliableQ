@@ -6,15 +6,19 @@
 //! branches here only log, they do not need to write `LEASE_LOST`
 //! themselves. Re-execution is safe against duplicate charges (M3): the
 //! idempotency key is derived deterministically per job. Failures are
-//! now classified and, if retryable, scheduled with capped exponential
-//! backoff and full jitter (M4) instead of always going straight to
-//! `DEAD`. Remaining gap, see `docs/failure-lab.md`:
-//!
-//! - jobs in a claimed batch are executed one at a time, unbounded
-//!   only in the sense that there is no semaphore yet (M6)
+//! classified and, if retryable, scheduled with capped exponential
+//! backoff and full jitter (M4). Dead jobs are explicitly replayable,
+//! never auto-reclaimed (M5). Concurrency is now bounded by a semaphore
+//! and long-running jobs get periodic lease renewal so a slow
+//! downstream call doesn't let the lease expire out from under
+//! legitimately in-progress work (M6).
 
-use std::time::Instant;
+pub mod poll;
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+pub use poll::run_worker_loop;
 use reliableq_core::failure::{FailureClass, classify_http_status, classify_network_error};
 use reliableq_core::retry::RetryPolicy;
 use reliableq_core::validation::parse_charge_payload;
@@ -22,6 +26,7 @@ use reliableq_db::jobs::{self, ClaimedJob};
 use reqwest::Client;
 use serde_json::json;
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -31,15 +36,63 @@ pub struct ExecutionFailure {
     pub message: String,
 }
 
-/// Executes one claimed job's charge call and finalizes the result.
-/// Never panics on a lost lease or downstream error: both are handled
-/// as ordinary, logged outcomes (spec sec. 19: no panics in normal
-/// runtime paths).
+/// Acquires one semaphore permit per job *before* spawning its task —
+/// this is the backpressure that keeps claiming from ever producing an
+/// unbounded task queue (spec sec. 9.5), not just a cap on parallel
+/// execution. Each task renews its own lease every `lease_duration / 3`
+/// while it runs (spec sec. 9.3).
+///
+/// Returns one `JoinHandle` per job so the caller can await the whole
+/// batch, or race it against a shutdown grace period.
+pub fn spawn_bounded_batch(
+    pool: PgPool,
+    client: Client,
+    charge_service_url: String,
+    retry_policy: RetryPolicy,
+    lease_duration: Duration,
+    semaphore: Arc<Semaphore>,
+    claimed: Vec<ClaimedJob>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    claimed
+        .into_iter()
+        .map(|job| {
+            let pool = pool.clone();
+            let client = client.clone();
+            let charge_service_url = charge_service_url.clone();
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    // Semaphore is only ever closed at process shutdown
+                    // after all permits are already accounted for; this
+                    // is unreachable in practice but must not panic.
+                    tracing::error!(job_id = %job.job.id, "semaphore closed before permit acquired");
+                    return;
+                };
+                execute_and_finalize(
+                    &pool,
+                    &client,
+                    &charge_service_url,
+                    &retry_policy,
+                    lease_duration,
+                    job,
+                )
+                .await;
+            })
+        })
+        .collect()
+}
+
+/// Executes one claimed job's charge call and finalizes the result,
+/// renewing its lease every `lease_duration / 3` for the duration of
+/// the call. Never panics on a lost lease or downstream error: both are
+/// handled as ordinary, logged outcomes (spec sec. 19: no panics in
+/// normal runtime paths).
 pub async fn execute_and_finalize(
     pool: &PgPool,
     client: &Client,
     charge_service_url: &str,
     retry_policy: &RetryPolicy,
+    lease_duration: Duration,
     claimed: ClaimedJob,
 ) {
     let job = claimed.job;
@@ -52,9 +105,12 @@ pub async fn execute_and_finalize(
         return;
     };
 
+    let heartbeat = spawn_heartbeat(pool.clone(), job.id, lease_token, lease_duration);
+
     let start = Instant::now();
     let outcome = execute_charge(client, charge_service_url, job.id, &job.payload).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+    heartbeat.abort();
 
     match outcome {
         Ok(()) => match jobs::finalize_success(pool, job.id, lease_token, duration_ms).await {
@@ -146,6 +202,35 @@ pub async fn execute_and_finalize(
             }
         }
     }
+}
+
+/// Renews the lease every `lease_duration / 3` (spec sec. 9.3) until
+/// aborted by the caller. Stops renewing (without panicking) the
+/// moment it discovers the lease is no longer held.
+fn spawn_heartbeat(
+    pool: PgPool,
+    job_id: Uuid,
+    lease_token: Uuid,
+    lease_duration: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let interval = (lease_duration / 3).max(Duration::from_millis(100));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match jobs::renew_lease(&pool, job_id, lease_token, lease_duration).await {
+                Ok(true) => {
+                    tracing::debug!(job_id = %job_id, "lease renewed");
+                }
+                Ok(false) => {
+                    tracing::warn!(job_id = %job_id, "lease renewal found the lease already gone");
+                    break;
+                }
+                Err(err) => {
+                    tracing::error!(job_id = %job_id, error = %err, "lease renewal failed");
+                }
+            }
+        }
+    })
 }
 
 /// Exposed as `pub` (beyond `execute_and_finalize`'s needs) so tests can
