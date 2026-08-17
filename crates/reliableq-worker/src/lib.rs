@@ -14,12 +14,14 @@
 //! (spec sec. 13.1), and every terminal transition is reflected in a
 //! Prometheus metric (spec sec. 13.2, M7).
 
+pub mod failpoint;
 pub mod metrics_server;
 pub mod poll;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use failpoint::{Failpoints, NoopFailpoints};
 pub use poll::run_worker_loop;
 use reliableq_core::failure::{FailureClass, classify_http_status, classify_network_error};
 use reliableq_core::redact::lease_token_hash;
@@ -115,6 +117,35 @@ pub async fn execute_and_finalize(
     lease_duration: Duration,
     claimed: ClaimedJob,
 ) {
+    execute_and_finalize_with_failpoints(
+        pool,
+        client,
+        charge_service_url,
+        retry_policy,
+        lease_duration,
+        claimed,
+        &NoopFailpoints,
+    )
+    .await;
+}
+
+/// Same as [`execute_and_finalize`] but checks `failpoints` at the
+/// three named crash points from spec sec. 12
+/// (`AfterClaimBeforeEffect`, `AfterEffectBeforeFinalize`,
+/// `DuringFinalize`), simulating a worker crash by returning
+/// immediately when one triggers — exactly what a real process death
+/// would leave behind (a claimed row with a ticking lease, or a
+/// committed charge with no finalize). Only the chaos suite calls this
+/// directly; `execute_and_finalize` always passes [`NoopFailpoints`].
+pub async fn execute_and_finalize_with_failpoints(
+    pool: &PgPool,
+    client: &Client,
+    charge_service_url: &str,
+    retry_policy: &RetryPolicy,
+    lease_duration: Duration,
+    claimed: ClaimedJob,
+    failpoints: &dyn Failpoints,
+) {
     let job = claimed.job;
     let attempt_number = claimed.attempt_number;
     let Some(lease_token) = job.lease_token else {
@@ -126,6 +157,11 @@ pub async fn execute_and_finalize(
     };
     let token_hash = lease_token_hash(lease_token);
 
+    if failpoints.should_trigger(failpoint::FailpointName::AfterClaimBeforeEffect, job.id) {
+        tracing::warn!(job_id = %job.id, "chaos: simulated crash after claim, before effect");
+        return;
+    }
+
     let heartbeat = spawn_heartbeat(pool.clone(), job.id, lease_token, lease_duration);
 
     let start = Instant::now();
@@ -133,6 +169,45 @@ pub async fn execute_and_finalize(
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
     let duration_secs = start.elapsed().as_secs_f64();
     heartbeat.abort();
+
+    if outcome.is_ok()
+        && failpoints.should_trigger(failpoint::FailpointName::AfterEffectBeforeFinalize, job.id)
+    {
+        tracing::warn!(job_id = %job.id, "chaos: simulated crash after effect, before finalize");
+        return;
+    }
+
+    if failpoints.should_trigger(failpoint::FailpointName::DuringFinalize, job.id) {
+        // Still perform the finalize call itself — a real crash "during"
+        // finalize most plausibly lands after the atomic DB transaction
+        // has already committed one way or the other; what a real crash
+        // prevents is the worker reacting to the result, not the
+        // transaction itself completing. This proves DB state is
+        // correct independent of whether the worker survives to see it.
+        match &outcome {
+            Ok(()) => {
+                let _ = jobs::finalize_success(pool, job.id, lease_token, duration_ms).await;
+            }
+            Err(failure) => {
+                let reason = if failure.class.is_retryable() {
+                    "RETRY_BUDGET_EXHAUSTED"
+                } else {
+                    failure.code
+                };
+                let _ = jobs::finalize_dead(
+                    pool,
+                    job.id,
+                    lease_token,
+                    reason,
+                    &failure.message,
+                    duration_ms,
+                )
+                .await;
+            }
+        }
+        tracing::warn!(job_id = %job.id, "chaos: simulated crash during finalize (after the DB call)");
+        return;
+    }
 
     match outcome {
         Ok(()) => match jobs::finalize_success(pool, job.id, lease_token, duration_ms).await {
