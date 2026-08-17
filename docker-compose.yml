@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: reliableq
+      POSTGRES_PASSWORD: reliableq
+      POSTGRES_DB: reliableq
+    ports:
+      - "5432:5432"
+    volumes:
+      - reliableq-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reliableq -d reliableq"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  reliableq-postgres-data:

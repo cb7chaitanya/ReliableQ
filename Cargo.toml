@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/reliableq-core",
+    "crates/reliableq-db",
 ]
 
 [workspace.package]
