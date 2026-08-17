@@ -318,3 +318,79 @@ superseded M1 tests documenting the now-fixed naive behavior).
 genuinely transient ones (timeout, `503`) — still goes straight to
 `DEAD` with no retry. The failure taxonomy (transient/permanent/
 ambiguous) and backoff schedule do not exist yet.
+
+## M4 — Failure taxonomy and retries
+
+**Invariant.** Invariant 8 (SPEC.md sec. 14): "Retry scheduling never
+exceeds configured bounds." Also: permanent failures must not retry
+(would waste the retry budget on outcomes that can't change), and
+transient failures must not retry so tightly that they overwhelm a
+struggling dependency.
+
+**Naive design under test.** M1-M3's worker treated every failure
+identically: straight to `DEAD` after one attempt, no distinction
+between "this will never work" (a validated `422` rejection) and "this
+might work in a second" (a `503`).
+
+**"Initially demonstrate tight retries."** Rather than build a
+throwaway naive-retry worker just to delete it, the danger of zero/tight
+backoff is demonstrated directly at the mechanism `finalize_retry_scheduled`
+exposes: nothing stops a caller from scheduling a retry with
+`delay_seconds = 0`, and if one does, the job is claimable again with
+**no wait at all**:
+
+```text
+running 1 test
+test zero_delay_retry_scheduling_makes_a_job_immediately_reclaimable ... ok
+```
+
+That test passing is itself the evidence: the repository layer places
+no floor on retry delay, so *only* the worker's policy — never a
+default of `0` — stands between this system and a thundering-herd
+retry loop against a failing downstream. That's why
+`reliableq_core::retry::RetryPolicy::DEFAULT` starts at `base_delay =
+1s` and full jitter draws from `[0, cap(n)]`, never a fixed point.
+
+**The smallest mechanism (ADR 0005).** `reliableq-core::failure`
+classifies downstream outcomes (`Transient`/`Permanent`/`Ambiguous`);
+`reliableq-core::retry` computes `cap(n) = min(max_delay, base_delay *
+multiplier^(n-1))` and `delay = uniform(0, cap(n))` with saturating
+arithmetic. The worker routes: retryable + budget remaining ->
+`finalize_retry_scheduled` (job back to `PENDING`, `next_attempt_at`
+computed in SQL from **database** time); retryable + budget exhausted,
+or permanent regardless of budget -> `finalize_dead`, with the reason
+distinguishing `RETRY_BUDGET_EXHAUSTED` from a genuine permanent
+failure code (spec sec. 11: metrics must be able to tell these apart).
+
+Deterministic chaos injection (`fake-charge`'s `chaos` module, disabled
+unless `FAKE_CHARGE_ENABLE_TEST_CONTROL` is explicitly set) let the
+worker-level tests exercise real transient/permanent/exhaustion
+sequences against the real HTTP path, not mocks.
+
+**What this still cannot guarantee.** `Retry-After` on `429`/`503` is
+not honored yet — those get the computed backoff like any other
+transient failure, not the server's suggested wait. Flagged as a real
+gap in ADR 0005, not silently dropped.
+
+**Evidence.** `reliableq-core` (15 new unit tests: 5 classification, 10
+retry math — cap growth/saturation/overflow-safety, delay bounds,
+determinism given a seed, statistical spread). `reliableq-db` (+2:
+`finalize_retry_scheduled` round-trip, the zero-delay demonstration
+above). `reliableq-worker` (+3, against real chaos-injected
+fake-charge): transient reschedules, permanent dies after one attempt,
+repeated transient failures exhaust budget and die with
+`RETRY_BUDGET_EXHAUSTED`:
+
+```text
+crates/reliableq-worker/tests/retries.rs
+  test transient_failure_reschedules_instead_of_dying ... ok
+  test permanent_failure_goes_dead_after_one_attempt ... ok
+  test transient_failures_exhausting_budget_eventually_die ... ok
+```
+
+Full gate (`make gate`): fmt clean, clippy clean, **87 tests passing,
+0 failed** (up from 71 at M3).
+
+**Residual risk carried into M5.** Dead jobs (from either exhaustion or
+a permanent failure) have no inspection endpoint and no replay path —
+`GET /v1/dead-jobs` and `POST /v1/jobs/{id}/retry` do not exist yet.
