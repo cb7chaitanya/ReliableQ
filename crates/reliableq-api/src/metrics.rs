@@ -77,8 +77,12 @@ async fn refresh_once(pool: &PgPool) -> Result<(), sqlx::Error> {
             .set(count as f64);
     }
 
+    // Postgres's EXTRACT(EPOCH FROM ...) returns NUMERIC, not
+    // double precision, so an explicit cast is required — without it
+    // sqlx's f64 decode fails every refresh cycle (caught by actually
+    // running this against live postgres, not just compiling it).
     let oldest_pending_age_seconds: Option<f64> = sqlx::query_scalar(
-        "SELECT EXTRACT(EPOCH FROM (now() - created_at)) FROM jobs \
+        "SELECT EXTRACT(EPOCH FROM (now() - created_at))::float8 FROM jobs \
          WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1",
     )
     .fetch_optional(pool)
