@@ -1,13 +1,15 @@
 //! reliableq-worker: claims due jobs and executes them against
-//! fake-charge. Crash recovery is now real (M2): `claim_pending_jobs`
+//! fake-charge. Crash recovery is real (M2): `claim_pending_jobs`
 //! reclaims expired leases and closes out the abandoned attempt as
 //! `LEASE_LOST`, and a stale worker's own finalize attempt is rejected
 //! by the token-fenced guard below — that is why the `Ok(false)`
 //! branches here only log, they do not need to write `LEASE_LOST`
-//! themselves. Remaining gaps, see `docs/failure-lab.md`:
+//! themselves. Re-execution is now safe against duplicate charges too
+//! (M3): the idempotency key is derived deterministically per job
+//! (`reliableq_core::idempotency::charge_idempotency_key`), and
+//! fake-charge replays rather than re-inserting on a repeat key.
+//! Remaining gaps, see `docs/failure-lab.md`:
 //!
-//! - the charge idempotency key is scoped per *attempt*, not per job
-//!   (M3 makes it job-scoped and adds graceful replay)
 //! - any execution failure goes straight to `DEAD`, no retry (M4)
 //! - jobs in a claimed batch are executed one at a time, unbounded
 //!   only in the sense that there is no semaphore yet (M6)
@@ -21,9 +23,10 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-struct ExecutionFailure {
-    code: &'static str,
-    message: String,
+#[derive(Debug)]
+pub struct ExecutionFailure {
+    pub code: &'static str,
+    pub message: String,
 }
 
 /// Executes one claimed job's charge call and finalizes the result.
@@ -47,14 +50,7 @@ pub async fn execute_and_finalize(
     };
 
     let start = Instant::now();
-    let outcome = execute_charge(
-        client,
-        charge_service_url,
-        job.id,
-        attempt_number,
-        &job.payload,
-    )
-    .await;
+    let outcome = execute_charge(client, charge_service_url, job.id, &job.payload).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
     match outcome {
@@ -107,11 +103,15 @@ pub async fn execute_and_finalize(
     }
 }
 
-async fn execute_charge(
+/// Exposed as `pub` (beyond `execute_and_finalize`'s needs) so tests can
+/// drive a single charge call without finalizing — the exact shape of
+/// "worker crashes after the effect commits but before finalize" that
+/// M3's duplicate-charge reproduction needs (see
+/// `crates/reliableq-worker/tests/duplicate_charge.rs`).
+pub async fn execute_charge(
     client: &Client,
     charge_service_url: &str,
     job_id: Uuid,
-    attempt_number: i32,
     payload: &serde_json::Value,
 ) -> Result<(), ExecutionFailure> {
     let charge_payload = parse_charge_payload(payload).map_err(|err| ExecutionFailure {
@@ -119,11 +119,10 @@ async fn execute_charge(
         message: err.to_string(),
     })?;
 
-    // Deliberately attempt-scoped, not job-scoped: see this module's
-    // doc comment and docs/failure-lab.md M3. A second attempt at this
-    // same job would send a different key, which is exactly the naive
-    // gap M3's duplicate-charge reproduction relies on.
-    let idempotency_key = format!("reliableq:charge:{job_id}:attempt:{attempt_number}");
+    // Job-scoped and deterministic (spec sec. 9.2): every attempt at
+    // this same job sends the same key, so a re-execution after a
+    // lease reclaim (M2) replays instead of duplicating (M3).
+    let idempotency_key = reliableq_core::idempotency::charge_idempotency_key(job_id);
 
     let response = client
         .post(format!("{charge_service_url}/v1/charges"))

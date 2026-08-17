@@ -1325,6 +1325,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -1364,6 +1365,8 @@ name = "reliableq-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "fake-charge",
  "rand 0.8.7",
  "reliableq-core",
  "reliableq-db",

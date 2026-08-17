@@ -23,3 +23,7 @@ sqlx.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+fake-charge = { path = "../fake-charge" }
+axum.workspace = true
