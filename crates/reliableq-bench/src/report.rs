@@ -556,6 +556,7 @@ fn write_analysis(
         let execution_peak_text = execution_zero_peak
             .map(|value| format!("{value:.0} jobs/sec"))
             .unwrap_or_else(|| "the execution scenario's observed peak".to_string());
+        writeln!(md)?;
         writeln!(
             md,
             "These backlog numbers are not directly comparable to the `execution` \
@@ -566,7 +567,6 @@ fn write_analysis(
              and additional resource instrumentation. Both use the real release worker \
              binary, but they answer different workload questions.\n"
         )?;
-        writeln!(md)?;
     }
 
     // --- Crash recovery timelines. ---
