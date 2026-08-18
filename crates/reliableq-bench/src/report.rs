@@ -171,6 +171,28 @@ pub fn generate(results_dir: &Path, docs_out: &Path, charts_out: &Path) -> anyho
     writeln!(md, "## Results by scenario\n")?;
     for (scenario, groups) in &by_scenario {
         writeln!(md, "### `{scenario}`\n")?;
+        match scenario.as_str() {
+            "crash_recovery_failpoint" => writeln!(
+                md,
+                "> This is a recovery benchmark. Throughput is included as raw context, \
+                 but it is not a useful capacity metric. The latency columns measure \
+                 attempt-one start to attempt-two start (the crash-to-reclaim gap).\n"
+            )?,
+            "crash_recovery_real_kill" => writeln!(
+                md,
+                "> This is a recovery benchmark. Read recovery duration, lease timing, \
+                 and correctness—not jobs/sec—as its result. The latency columns are \
+                 end-to-end job latency for the small recovery workload.\n"
+            )?,
+            "idempotency_contention" => writeln!(
+                md,
+                "> Each point is a short burst containing only `concurrency` requests \
+                 against one shared key. At the smallest sizes, startup and scheduling \
+                 noise dominate, so these points verify contention safety and latency; \
+                 they are not a monotonic service-scaling curve.\n"
+            )?,
+            _ => {}
+        }
         writeln!(
             md,
             "| Params | Runs | Throughput ({}) | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) | Correctness |",
@@ -238,7 +260,11 @@ pub fn generate(results_dir: &Path, docs_out: &Path, charts_out: &Path) -> anyho
     // --- Charts, generated straight from the grouped raw data. ---
     writeln!(md, "## Charts\n")?;
     if let Some(path) = chart_throughput_vs_concurrency(&by_scenario, charts_out)? {
-        writeln!(md, "![Throughput vs worker concurrency]({})\n", rel(&path))?;
+        writeln!(
+            md,
+            "![Throughput vs concurrency in one worker process]({})\n",
+            rel(&path)
+        )?;
     }
     if let Some(path) = chart_retry_amplification(&by_scenario, charts_out)? {
         writeln!(
@@ -431,16 +457,18 @@ fn write_analysis(
                 }
                 let _ = write!(
                     narrative,
-                    "{prev_c:.0}->{c:.0} workers: {prev_t:.0}->{t:.0} jobs/sec ({:+.0}%); ",
+                    "concurrency {prev_c:.0}->{c:.0}: {prev_t:.0}->{t:.0} jobs/sec ({:+.0}%); ",
                     marginal * 100.0
                 );
             }
+            narrative.truncate(narrative.trim_end_matches("; ").len());
             writeln!(md, "{narrative}\n")?;
             match saturation_point {
                 Some(c) => writeln!(
                     md,
                     "Marginal throughput gain from added concurrency drops below 15% \
-                     past **{c:.0} workers** at 0ms downstream latency on this machine — \
+                     past **worker concurrency {c:.0}** in one worker process at 0ms \
+                     downstream latency on this machine — \
                      consistent with claim/finalize transaction overhead (not the \
                      downstream) becoming the bottleneck. Treat this as a local, \
                      8-logical-CPU-laptop number, not a universal ceiling.\n"
@@ -506,6 +534,38 @@ fn write_analysis(
                 group_mean_throughput(g)
             )?;
         }
+        let backlog_max_jobs = groups
+            .iter()
+            .flat_map(|g| g.runs.iter().map(|r| r.job_count))
+            .max()
+            .unwrap_or(0);
+        let execution_zero_peak = by_scenario.get("execution").and_then(|execution_groups| {
+            execution_groups
+                .iter()
+                .filter(|g| param_f64(g, "downstream_latency_ms") == Some(0.0))
+                .map(|g| group_mean_throughput(g))
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+        });
+        let execution_max_jobs = by_scenario
+            .get("execution")
+            .into_iter()
+            .flatten()
+            .flat_map(|g| g.runs.iter().map(|r| r.job_count))
+            .max()
+            .unwrap_or(0);
+        let execution_peak_text = execution_zero_peak
+            .map(|value| format!("{value:.0} jobs/sec"))
+            .unwrap_or_else(|| "the execution scenario's observed peak".to_string());
+        writeln!(
+            md,
+            "These backlog numbers are not directly comparable to the `execution` \
+             scenario's {execution_peak_text}. The backlog points contain up to \
+             {backlog_max_jobs} measured jobs, skip the execution scenario's resource \
+             samplers, and amortize process startup and polling over a larger drain. The \
+             execution sweep contains up to {execution_max_jobs} measured jobs per point \
+             and additional resource instrumentation. Both use the real release worker \
+             binary, but they answer different workload questions.\n"
+        )?;
         writeln!(md)?;
     }
 
@@ -618,6 +678,36 @@ fn write_analysis(
             )?;
         }
         writeln!(md)?;
+        writeln!(
+            md,
+            "CPU values come from 500ms `ps` samples of individual macOS processes; \
+             PostgreSQL CPU comes from Docker container sampling. They are directional \
+             utilization signals with different accounting boundaries, not a complete \
+             host-wide CPU budget. Short runs may contain too few samples to characterize \
+             peaks reliably.\n"
+        )?;
+    }
+
+    if let Some(groups) = by_scenario.get("idempotency_contention") {
+        writeln!(md, "### Idempotency-contention interpretation\n")?;
+        let mut points: Vec<(f64, f64)> = groups
+            .iter()
+            .filter_map(|g| Some((param_f64(g, "concurrency")?, group_mean_throughput(g))))
+            .collect();
+        points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let non_monotonic = points.windows(2).any(|w| w[1].1 < w[0].1);
+        if non_monotonic {
+            writeln!(
+                md,
+                "The throughput points are non-monotonic (notably the concurrency-4 \
+                 result). Each point issues only as many requests as its concurrency, so \
+                 the smallest runs are millisecond-scale bursts dominated by scheduling, \
+                 connection reuse, and timer noise. Use this scenario to evaluate the \
+                 invariant—one committed charge per shared key—and its latency under \
+                 contention. A sustained, fixed-request-count workload is required before \
+                 making idempotency-service capacity claims.\n"
+            )?;
+        }
     }
 
     Ok(())
@@ -665,6 +755,13 @@ fn write_limitations(md: &mut String, clean_runs: &[RunResult]) -> anyhow::Resul
          report: {}.\n",
         job_counts.iter().max().copied().unwrap_or(0)
     )?;
+    writeln!(
+        md,
+        "- **The idempotency scenario uses microbursts, not a sustained load** — each \
+         point sends only `concurrency` requests. Its non-monotonic throughput values \
+         should not be interpreted as a scaling curve; the useful results are contention \
+         latency and the exactly-one-charge invariant.\n"
+    )?;
     Ok(())
 }
 
@@ -708,7 +805,7 @@ fn chart_throughput_vs_concurrency(
         root.fill(&WHITE)?;
         let mut chart = ChartBuilder::on(&root)
             .caption(
-                "Execution throughput vs worker concurrency",
+                "Execution throughput vs concurrency (one worker process)",
                 ("sans-serif", 20),
             )
             .margin(20)
