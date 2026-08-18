@@ -76,6 +76,12 @@ pub async fn run(ctx: &ScenarioCtx) -> anyhow::Result<()> {
                 expect_all_terminal: false,
                 worker_capacity: None,
                 observed_peak_inflight: None,
+                // These latencies are already Instant-based (immune to
+                // the wall-clock-sleep issue this check targets — see
+                // GateInput's doc comment), so there's nothing useful to
+                // cross-check here.
+                latency_samples_ms: &[],
+                measurement_window_secs: 0.0,
             })
             .await?;
 

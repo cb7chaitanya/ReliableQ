@@ -152,6 +152,8 @@ pub async fn run(ctx: &ScenarioCtx) -> anyhow::Result<()> {
                 expect_all_terminal: drained,
                 worker_capacity: Some(cfg.worker_concurrency as u64),
                 observed_peak_inflight: chaos.peak_inflight().await.ok(),
+                latency_samples_ms: &latencies,
+                measurement_window_secs: elapsed,
             })
             .await?;
 

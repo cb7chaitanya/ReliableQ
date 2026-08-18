@@ -178,6 +178,8 @@ async fn run_point(
         expect_all_terminal: drained,
         worker_capacity: Some(concurrency as u64),
         observed_peak_inflight: peak_inflight,
+        latency_samples_ms: &latencies,
+        measurement_window_secs: elapsed,
     })
     .await?;
 

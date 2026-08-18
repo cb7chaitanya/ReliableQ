@@ -168,6 +168,8 @@ async fn run_failpoint(
         expect_all_terminal: reached_quiescence,
         worker_capacity: None,
         observed_peak_inflight: None,
+        latency_samples_ms: &recovery_gaps,
+        measurement_window_secs: elapsed,
     })
     .await?;
 
@@ -290,6 +292,8 @@ async fn run_real_kill(ctx: &ScenarioCtx, job_count: u64, run_number: u32) -> an
         expect_all_terminal: drained,
         worker_capacity: None,
         observed_peak_inflight: None,
+        latency_samples_ms: &latencies,
+        measurement_window_secs: total_elapsed,
     })
     .await?;
 

@@ -26,6 +26,18 @@ pub struct GateInput<'a> {
     /// `peak_inflight` observed via fake-charge's `/v1/test/inflight`
     /// (reset before the scenario started).
     pub observed_peak_inflight: Option<u64>,
+    /// Wall-clock-derived latency samples (created_at/finished_at,
+    /// job_attempts.started_at, etc.) this run collected, if any, paired
+    /// with `measurement_window_secs` — the same scenario's own
+    /// `Instant`-based elapsed time. `Instant` is monotonic and unaffected
+    /// by the host sleeping mid-run; PostgreSQL timestamps are wall-clock
+    /// and are not — a host sleep/wake spanning a job's lifetime produces
+    /// an impossible multi-hour latency sample with a perfectly normal
+    /// `measurement_duration_secs`. Caught by actually running the quick
+    /// profile on a laptop that went to sleep mid-run, not by inspection —
+    /// see docs/benchmarking/design.md sec. 8.
+    pub latency_samples_ms: &'a [f64],
+    pub measurement_window_secs: f64,
 }
 
 pub async fn run_gate(input: GateInput<'_>) -> anyhow::Result<CorrectnessResults> {
@@ -166,6 +178,31 @@ pub async fn run_gate(input: GateInput<'_>) -> anyhow::Result<CorrectnessResults
         if !within_capacity {
             failures.push(format!(
                 "observed peak_inflight {peak} exceeded configured capacity {capacity}"
+            ));
+        }
+    }
+
+    // 7. wall-clock latency samples must be consistent with this run's
+    // own monotonic elapsed time (generous 2x + 30s slack for submission
+    // time, warmup, and poll-interval overhead outside the strict
+    // measurement window) — catches a host sleep/wake spanning the run.
+    if !input.latency_samples_ms.is_empty() && input.measurement_window_secs > 0.0 {
+        let threshold_ms = input.measurement_window_secs * 1000.0 * 2.0 + 30_000.0;
+        let max_sample = input
+            .latency_samples_ms
+            .iter()
+            .cloned()
+            .fold(0.0_f64, f64::max);
+        let within_window = max_sample <= threshold_ms;
+        checks.insert(
+            "latency_samples_within_measurement_window".into(),
+            Value::Bool(within_window),
+        );
+        if !within_window {
+            failures.push(format!(
+                "a latency sample of {max_sample:.0}ms far exceeds this run's own \
+                 measurement window ({threshold_ms:.0}ms threshold) — likely the host \
+                 slept/woke mid-run, corrupting wall-clock (not monotonic) timestamps"
             ));
         }
     }

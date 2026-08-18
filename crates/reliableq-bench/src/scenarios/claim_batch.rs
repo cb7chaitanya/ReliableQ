@@ -111,6 +111,8 @@ pub async fn run(ctx: &ScenarioCtx) -> anyhow::Result<()> {
                 expect_all_terminal: true,
                 worker_capacity: None,
                 observed_peak_inflight: None,
+                latency_samples_ms: &queue_latencies,
+                measurement_window_secs: elapsed,
             })
             .await?;
 
